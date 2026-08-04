@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>思政案例生成工作台 - 原型</title>
+<style>
+  :root {
+    --primary: #b3282d;
+    --primary-dark: #8f1f23;
+    --bg: #f6f4f1;
+    --card-bg: #ffffff;
+    --border: #e3ddd6;
+    --text: #2b2622;
+    --muted: #8a817a;
+    --success: #3a7d44;
+    --warning: #c17817;
+    --danger: #b3282d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+  }
+  h1 { font-size: 18px; margin: 0; }
+  .subtitle { color: var(--muted); font-size: 12px; }
+
+  /* ---------- 顶部：标题 + 全局案例上下文 ---------- */
+  .app-header {
+    background: var(--card-bg);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .context-bar { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .context-bar input, .context-bar select {
+    padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+    font-size: 13px; font-family: inherit;
+  }
+  .context-bar input[type=text] { width: 90px; }
+
+  /* ---------- 标签导航 ---------- */
+  .tab-nav { display: flex; gap: 4px; background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 0 24px; }
+  .tab-btn {
+    background: none; border: none; color: var(--muted); padding: 12px 18px; margin: 0;
+    font-size: 14px; cursor: pointer; border-bottom: 3px solid transparent;
+  }
+  .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+  .tab-btn:hover:not(.active) { color: var(--text); }
+
+  .view { display: none; padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
+  .view.active { display: block; }
+
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 16px; margin: 0 0 14px; border-left: 4px solid var(--primary); padding-left: 8px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  input[type=text], select, textarea {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+    font-size: 14px; font-family: inherit;
+  }
+  textarea { resize: vertical; }
+  button {
+    background: var(--primary); color: white; border: none; padding: 9px 16px;
+    border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 10px;
+  }
+  button:hover { background: var(--primary-dark); }
+  button.secondary { background: #6b6259; }
+  button.secondary:hover { background: #514a43; }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+
+  /* ---------- 聊天视图（AI助手，取代原来的案例工作台） ---------- */
+  .chat-layout { display: flex; gap: 16px; align-items: flex-start; max-width: 1020px; margin: 0 auto; }
+  .session-sidebar { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+  .session-sidebar > button { margin: 0; }
+  .session-list { display: flex; flex-direction: column; gap: 6px; max-height: calc(100vh - 220px); overflow-y: auto; }
+  .session-item {
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 26px 8px 10px;
+    font-size: 12.5px; cursor: pointer; background: var(--card-bg); position: relative;
+  }
+  .session-item:hover { border-color: var(--primary); }
+  .session-item.active { border-color: var(--primary); background: #fbeff0; }
+  .session-item .s-title {
+    display: block; font-weight: 600; margin-bottom: 2px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .session-item .s-meta { color: var(--muted); font-size: 10.5px; }
+  .session-item .s-delete {
+    position: absolute; top: 6px; right: 6px; background: none; border: none;
+    color: var(--muted); font-size: 12px; cursor: pointer; padding: 0; margin: 0;
+  }
+  .session-item .s-delete:hover { color: var(--danger); }
+  .chat-wrap { display: flex; flex-direction: column; height: calc(100vh - 140px); flex: 1; min-width: 0; }
+  .chat-messages { flex: 1; overflow-y: auto; padding: 14px 4px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
+  .msg.assistant { background: var(--card-bg); border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 2px; }
+  .msg.user { background: var(--primary); color: white; align-self: flex-end; border-bottom-right-radius: 2px; }
+  .msg .meta { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .msg.user .meta { color: #f3d9da; }
+  .tool-chip {
+    align-self: center; background: #f0ece7; color: #8a817a; font-size: 11px;
+    padding: 3px 10px; border-radius: 10px;
+  }
+  .suggestion-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 4px 10px; }
+  .suggestion-chip { background: #fff; border: 1px solid var(--border); color: var(--text); border-radius: 16px; padding: 6px 12px; font-size: 12px; cursor: pointer; margin: 0; }
+  .suggestion-chip:hover { border-color: var(--primary); color: var(--primary); }
+  .chat-input-row { display: flex; gap: 8px; padding: 10px 4px 0; border-top: 1px solid var(--border); }
+  .chat-input-row textarea { flex: 1; resize: none; height: 44px; padding: 10px 12px; }
+  .chat-input-row button { margin-top: 0; align-self: flex-end; height: 44px; }
+  .chat-hint { text-align: center; color: var(--muted); font-size: 11px; padding: 6px 0 0; }
+
+  /* ---------- 素材库 / 通用列表卡片 ---------- */
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 8px; padding: 22px; text-align: center;
+    color: var(--muted); font-size: 13px; cursor: pointer; margin-top: 10px; transition: border-color .15s, background .15s;
+  }
+  .dropzone.dragover { border-color: var(--primary); background: #fbeff0; color: var(--primary); }
+  .dropzone .hint { font-size: 12px; margin-top: 4px; }
+
+  .material-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; font-size: 13px; }
+  .material-item .row1 { display: flex; align-items: center; gap: 8px; }
+  .material-item .src-icon { font-size: 15px; }
+  .material-item .title { color: var(--text); word-break: break-all; flex: 1; }
+  .material-item .title a { color: var(--primary-dark); }
+  .status-badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
+  .status-success { background: #e6f2e6; color: var(--success); }
+  .status-failed { background: #fbeaea; color: var(--danger); }
+  .status-pending { background: #fdf3e0; color: var(--warning); }
+  .material-item .preview-text { color: #888; margin-top: 6px; }
+  .material-item .actions { display: flex; gap: 10px; margin-top: 6px; }
+  .link-btn { background: none; border: none; color: var(--primary); font-size: 12px; padding: 0; margin: 0; cursor: pointer; text-decoration: underline; }
+  .empty-hint { color: var(--muted); font-size: 13px; text-align: center; padding: 40px 0; }
+  .section-title { font-weight: 600; font-size: 14px; margin: 16px 0 6px; display: flex; align-items: center; gap: 8px; }
+  .section-title .badge { background: #f0e8de; color: #8a6a3a; font-size: 11px; padding: 2px 8px; border-radius: 4px; }
+  .narrative-box { white-space: pre-wrap; line-height: 1.9; font-size: 14px; background: #fbfaf8; border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+  th, td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #f0ece7; }
+  .top-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .case-status { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .status-草稿 { background: #eee; color: #888; }
+  .status-待审核 { background: #fdf3e0; color: var(--warning); }
+  .status-已采纳 { background: #e6f2e6; color: var(--success); }
+  .status-已驳回 { background: #fbeaea; color: var(--danger); }
+  .toast {
+    position: fixed; top: 20px; right: 20px; background: #2b2622; color: white;
+    padding: 10px 18px; border-radius: 6px; font-size: 13px; z-index: 999; opacity: 0.95;
+  }
+  .loading { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .inline-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .inline-row > div { flex: 1; min-width: 160px; }
+
+  /* ---------- 弹窗（素材预览 / 案例详情共用） ---------- */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 1000; align-items: center; justify-content: center; }
+  .modal-overlay.active { display: flex; }
+  .modal-box { background: var(--card-bg); border-radius: 10px; width: 680px; max-width: 92vw; max-height: 84vh; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-box .modal-header { padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .modal-box .modal-header h3 { margin: 0; font-size: 15px; }
+  .modal-box .modal-body { padding: 16px 18px; overflow-y: auto; font-size: 13px; line-height: 1.8; }
+  .modal-close { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; margin: 0; }
+</style>
+</head>
+<body>
+
+<div class="app-header">
+  <div>
+    <h1>📘 思政案例生成工作台</h1>
+    <div class="subtitle">素材导入 → AI助手对话生成/编辑 → 案例库审核导出 → 知识点匹配补充 | 原型 v0.3</div>
+  </div>
+  <div class="context-bar">
+    <span>素材导入上下文</span>
+    <input type="text" id="caseCode" value="3.4" title="案例编号，用于素材库导入分组和AI助手默认上下文">
+    <select id="dimensionSelect"></select>
+  </div>
+</div>
+
+<div class="tab-nav">
+  <button class="tab-btn active" data-view="chat" onclick="switchView('chat')">💬 AI 助手</button>
+  <button class="tab-btn" data-view="library" onclick="switchView('library')">📂 素材库</button>
+  <button class="tab-btn" data-view="caselibrary" onclick="switchView('caselibrary')">📚 案例库</button>
+  <button class="tab-btn" data-view="knowledge" onclick="switchView('knowledge')">🧩 知识点匹配</button>
+</div>
+
+<!-- ============ 视图一：AI 助手（生成+编辑案例的主入口） ============ -->
+<div class="view active" id="view-chat">
+  <div class="chat-layout">
+    <div class="session-sidebar">
+      <button onclick="createNewSession()">＋ 新对话</button>
+      <div class="session-list" id="sessionList"></div>
+    </div>
+    <div class="chat-wrap">
+      <div class="chat-messages" id="chatMessages"></div>
+      <div class="suggestion-row" id="chatSuggestions"></div>
+      <div class="chat-input-row">
+        <textarea id="chatInput" placeholder="跟AI助手说说你想做什么，例如「帮我生成案例3.4的初稿」「把开头场景写得更有画面感」…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}"></textarea>
+        <button onclick="sendChat()">发送</button>
+      </div>
+      <div class="chat-hint" id="chatStatusHint">案例生成、逐段编辑、审核状态调整都可以直接在这里用自然语言完成；素材导入和最终导出仍在专门的标签页里。左侧可以切换/新建/删除历史对话。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 视图二：素材库 ============ -->
+<div class="view" id="view-library">
+  <div class="card">
+    <h2>方式一：粘贴 URL 批量抓取</h2>
+    <label>粘贴URL（每行一个，会归入上方「素材导入上下文」的案例编号）</label>
+    <textarea id="urlInput" rows="4" placeholder="https://news.qq.com/rain/a/xxxx&#10;https://www.sohu.com/a/xxxx"></textarea>
+    <button onclick="importMaterials()">抓取并导入素材</button>
+    <div id="importLoading" class="loading" style="display:none;">正在抓取，请稍候...</div>
+  </div>
+
+  <div class="card">
+    <h2>方式二：上传 Word / PDF，自动拆分案例</h2>
+    <div class="dropzone" id="dropzone">
+      📄 点击选择，或将 .docx / .pdf 文件拖拽到这里
+      <div class="hint">系统会按标题/编号规则尝试把文档拆分成多条候选案例，分别存入下方素材库；拆不出明显结构时会整篇作为一条素材保留。</div>
+    </div>
+    <input type="file" id="fileInput" accept=".docx,.pdf" style="display:none">
+    <div id="uploadLoading" class="loading" style="display:none;">正在解析文档，请稍候...</div>
+  </div>
+
+  <div class="card">
+    <div class="top-bar">
+      <h2 style="margin:0;border:none;">素材库（当前案例：<span id="libCaseCodeLabel"></span>）</h2>
+      <button class="secondary" style="margin:0;" onclick="loadMaterials()">刷新</button>
+    </div>
+    <div id="materialList"><div class="empty-hint">暂无素材，请先导入</div></div>
+    <button onclick="sendSelectedToAgent()">🤖 用勾选素材，去「AI助手」生成案例草稿</button>
+  </div>
+</div>
+
+<!-- ============ 视图三：案例库（列表 + 勾选导出Word，替代原来的案例工作台） ============ -->
+<div class="view" id="view-caselibrary">
+  <div class="card">
+    <div class="top-bar">
+      <h2 style="margin:0;border:none;">已生成的案例（草稿 / 待审核 / 已采纳 / 已驳回）</h2>
+      <div>
+        <button class="secondary" style="margin:0;" onclick="loadCases()">刷新</button>
+        <button class="secondary" style="margin:0;" onclick="exportBook()">📖 导出成书（前言+按维度分章+附录+图谱）</button>
+        <button style="margin:0;" onclick="exportSelectedCases()">⬇️ 导出勾选为 Word</button>
+      </div>
+    </div>
+    <div class="chat-hint" style="text-align:left;padding:8px 0 0;">案例内容的生成与逐段修改请到「💬 AI 助手」标签页用对话完成；这里主要用来审阅、勾选、批量导出。</div>
+    <div id="caseLibraryList" style="margin-top:10px;"><div class="empty-hint">还没有生成任何案例，先去「💬 AI 助手」生成一个吧</div></div>
+  </div>
+</div>
+
+<!-- ============ 视图四：知识点匹配 ============ -->
+<div class="view" id="view-knowledge">
+  <div class="card">
+    <h2>批量上传课程教学大纲，自动拆解课程与知识点</h2>
+    <div class="inline-row">
+      <div>
+        <label>课程名称（可选）</label>
+        <input type="text" id="courseNameInput" placeholder="留空则从每份文档标题自动识别；同一门课程分多个文件上传时可在这里统一填写">
+      </div>
+    </div>
+    <div class="dropzone" id="knowledgeDropzone">
+      📚 点击选择，或把多个专业/课程的教学大纲 .docx / .pdf 一起拖拽到这里
+      <div class="hint">支持一次选择/拖拽多个文件；每份文档会各自识别课程名称（取自标题或《书名号》），再按章节把正文拆解成一条条候选知识点。</div>
+    </div>
+    <input type="file" id="knowledgeFileInput" accept=".docx,.pdf" multiple style="display:none">
+    <div id="knowledgeUploadLoading" class="loading" style="display:none;">正在解析大纲，请稍候...</div>
+  </div>
+
+  <div class="card">
+    <div class="top-bar">
+      <h2 style="margin:0;border:none;">知识点库</h2>
+      <button class="secondary" style="margin:0;" onclick="loadKnowledgePoints()">刷新</button>
+    </div>
+    <div class="inline-row" style="margin-top:6px;">
+      <div>
+        <label>按课程筛选</label>
+        <select id="courseFilterSelect" onchange="renderKnowledgeList()"></select>
+      </div>
+    </div>
+    <div id="knowledgeList" style="margin-top:10px;"><div class="empty-hint">还没有导入任何知识点，先上传课程教学大纲</div></div>
+  </div>
+
+  <div class="card">
+    <h2>知识图谱</h2>
+    <div class="chat-hint" style="text-align:left;padding:0 0 6px;">基于"已采纳"状态的案例、以及已采纳的知识点关联，画出 维度→案例→知识点 三层关系图。</div>
+    <button class="secondary" onclick="window.open(API_BASE + '/api/knowledge_graph.png', '_blank')">🖼 查看图谱（图片）</button>
+    <button class="secondary" onclick="window.open(API_BASE + '/api/knowledge_graph.html', '_blank')">🕸 查看图谱（可交互）</button>
+  </div>
+
+  <div class="card">
+    <h2>案例 ↔ 知识点 匹配</h2>
+    <div class="inline-row">
+      <div>
+        <label>选择案例</label>
+        <select id="matchCaseSelect"></select>
+      </div>
+      <div style="flex:0;">
+        <button onclick="runMatch()">🔍 运行匹配</button>
+      </div>
+    </div>
+    <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、编辑融入方式建议</div></div>
+    <button onclick="enrichCurrentCase()" style="background:var(--success)">✨ 用已采纳的知识点，补充该案例的「适用课程举例」与「教学设计」</button>
+  </div>
+</div>
+
+<!-- ============ 弹窗：素材/案例详情预览 ============ -->
+<div class="modal-overlay" id="previewModal" onclick="if(event.target===this)closePreview()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3 id="previewTitle">预览</h3>
+      <button class="modal-close" onclick="closePreview()">✕</button>
+    </div>
+    <div class="modal-body" id="previewBody"></div>
+  </div>
+</div>
+
+<script>
+const API_BASE = "http://localhost:8000";
+
+let materialsCache = [];
+let selectedMaterialIds = new Set();
+let casesCache = [];
+let selectedCaseIds = new Set();
+let knowledgePointsCache = [];
+let currentMatchCaseId = null;
+let currentMappings = [];
+let chatHistory = []; // 当前会话的 Anthropic messages 格式历史，随会话切换而替换
+let sessionsCache = [];
+let currentSessionId = null;
+
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function toast(msg) {
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+function switchView(name) {
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  document.getElementById(`view-${name}`).classList.add("active");
+  document.querySelector(`.tab-btn[data-view="${name}"]`).classList.add("active");
+  if (name === "library") loadMaterials();
+  if (name === "caselibrary") loadCases();
+  if (name === "knowledge") { loadKnowledgePoints(); loadCases(); }
+}
+
+/* ================= AI 助手（agent对话，真实接入Claude工具调用） ================= */
+const SUGGESTIONS = [
+  "帮我生成案例3.4的初稿",
+  "这个案例现在是什么状态？",
+  "把开头场景写得更有画面感一点",
+  "把状态改成已采纳",
+];
+
+function renderSuggestions() {
+  document.getElementById("chatSuggestions").innerHTML = SUGGESTIONS.map(s =>
+    `<button class="suggestion-chip" onclick="sendChat(${JSON.stringify(s)})">${s}</button>`
+  ).join("");
+}
+
+function stripContextPrefix(text) {
+  return text.replace(/^\[当前案例编号[^\]]*\]\n/, "");
+}
+
+function addBubble(container, role, text) {
+  const div = document.createElement("div");
+  div.className = `msg ${role}`;
+  div.innerHTML = `<span class="meta">${role === "user" ? "你" : "AI 助手"}</span>${escHtml(text)}`;
+  container.appendChild(div);
+}
+
+function addToolChip(container, text) {
+  const div = document.createElement("div");
+  div.className = "tool-chip";
+  div.textContent = text;
+  container.appendChild(div);
+}
+
+function renderChatMessages() {
+  const box = document.getElementById("chatMessages");
+  box.innerHTML = "";
+  if (chatHistory.length === 0) {
+    addBubble(box, "assistant",
+      "你好，我是思政案例生成工作台的AI助手 👋\n可以直接跟我说要生成或修改案例的哪部分，比如「帮我生成案例3.4的初稿」「把教学设计部分再具体一点」「审核通过这个案例」。素材导入、文档拆分在「📂 素材库」，最终审阅导出在「📚 案例库」。左侧栏可以新建/切换/删除历史对话。");
+  }
+
+  for (const msg of chatHistory) {
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        addBubble(box, "user", stripContextPrefix(msg.content));
+      } else {
+        addToolChip(box, "⚙️ 工具执行完成");
+      }
+    } else if (msg.role === "assistant") {
+      const blocks = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
+      for (const b of blocks) {
+        if (b.type === "text" && b.text && b.text.trim()) {
+          addBubble(box, "assistant", b.text);
+        } else if (b.type === "tool_use") {
+          addToolChip(box, `🔧 调用工具：${b.name}`);
+        }
+      }
+    }
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+function setChatLoading(loading) {
+  document.getElementById("chatStatusHint").textContent = loading
+    ? "AI助手正在处理中，如果涉及生成/改写全文可能需要10-30秒，请稍候..."
+    : "案例生成、逐段编辑、审核状态调整都可以直接在这里用自然语言完成；素材导入和最终导出仍在专门的标签页里。";
+}
+
+/* ---- 会话（session）管理：左侧栏历史记录 ---- */
+async function loadSessions() {
+  const res = await fetch(`${API_BASE}/api/chat/sessions`);
+  sessionsCache = await res.json();
+  if (sessionsCache.length === 0) {
+    await createNewSession();
+    return;
+  }
+  renderSessionList();
+  if (!currentSessionId) {
+    await switchSession(sessionsCache[0].id);
+  }
+}
+
+function renderSessionList() {
+  const el = document.getElementById("sessionList");
+  el.innerHTML = sessionsCache.map(s => `
+    <div class="session-item ${s.id === currentSessionId ? "active" : ""}" onclick="switchSession(${s.id})">
+      <span class="s-title">${escHtml(s.title || "新对话")}</span>
+      <span class="s-meta">${s.message_count} 条消息</span>
+      <button class="s-delete" title="删除这段对话" onclick="event.stopPropagation();deleteSession(${s.id})">✕</button>
+    </div>`).join("");
+}
+
+async function createNewSession() {
+  const res = await fetch(`${API_BASE}/api/chat/sessions`, { method: "POST" });
+  const session = await res.json();
+  sessionsCache.unshift({ id: session.id, title: session.title, updated_at: session.updated_at, message_count: 0 });
+  currentSessionId = session.id;
+  chatHistory = [];
+  renderSessionList();
+  renderChatMessages();
+}
+
+async function switchSession(id) {
+  if (id === currentSessionId) return;
+  currentSessionId = id;
+  const res = await fetch(`${API_BASE}/api/chat/sessions/${id}`);
+  const session = await res.json();
+  chatHistory = session.messages || [];
+  renderSessionList();
+  renderChatMessages();
+}
+
+async function deleteSession(id) {
+  await fetch(`${API_BASE}/api/chat/sessions/${id}`, { method: "DELETE" });
+  sessionsCache = sessionsCache.filter(s => s.id !== id);
+  if (currentSessionId === id) {
+    currentSessionId = null;
+    if (sessionsCache.length > 0) {
+      await switchSession(sessionsCache[0].id);
+    } else {
+      await createNewSession();
+    }
+  } else {
+    renderSessionList();
+  }
+}
+
+async function sendChat(overrideText) {
+  const input = document.getElementById("chatInput");
+  const rawText = overrideText !== undefined ? overrideText : input.value.trim();
+  if (!rawText) return;
+  if (overrideText === undefined) input.value = "";
+  if (!currentSessionId) await createNewSession();
+
+  const caseCode = document.getElementById("caseCode").value.trim();
+  const dimension = document.getElementById("dimensionSelect").value;
+
+  chatHistory.push({ role: "user", content: rawText }); // 乐观展示，不带隐藏上下文前缀
+  renderChatMessages();
+  setChatLoading(true);
+
+  try {
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: currentSessionId, message: rawText, case_code: caseCode, dimension }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "AI助手出错");
+    chatHistory = data.session.messages;
+
+    const idx = sessionsCache.findIndex(s => s.id === currentSessionId);
+    if (idx >= 0) {
+      const [item] = sessionsCache.splice(idx, 1);
+      item.title = data.session.title;
+      item.updated_at = data.session.updated_at;
+      item.message_count = chatHistory.length;
+      sessionsCache.unshift(item);
+    }
+    renderSessionList();
+    renderChatMessages();
+  } catch (e) {
+    chatHistory.push({ role: "assistant", content: `⚠ ${e.message}` });
+    renderChatMessages();
+  } finally {
+    setChatLoading(false);
+  }
+}
+
+function sendSelectedToAgent() {
+  const caseCode = document.getElementById("caseCode").value.trim();
+  const dimension = document.getElementById("dimensionSelect").value;
+  const ids = Array.from(selectedMaterialIds);
+  if (ids.length === 0) {
+    toast("请先在素材库里勾选至少一条抓取/解析成功的素材");
+    return;
+  }
+  switchView("chat");
+  sendChat(`请用素材ID ${JSON.stringify(ids)} 生成案例${caseCode}的初稿，思政维度是"${dimension}"。`);
+}
+
+/* ================= 维度 ================= */
+async function loadDimensions() {
+  const res = await fetch(`${API_BASE}/api/dimensions`);
+  const dims = await res.json();
+  const sel = document.getElementById("dimensionSelect");
+  sel.innerHTML = dims.map(d => `<option value="${d}">${d}</option>`).join("");
+}
+
+/* ================= 素材库：URL 导入 ================= */
+async function importMaterials() {
+  const caseCode = document.getElementById("caseCode").value.trim();
+  const urls = document.getElementById("urlInput").value.split("\n").map(u => u.trim()).filter(Boolean);
+  if (!caseCode || urls.length === 0) {
+    toast("请填写案例编号并粘贴至少一个URL");
+    return;
+  }
+  document.getElementById("importLoading").style.display = "block";
+  try {
+    const res = await fetch(`${API_BASE}/api/materials/import`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ case_code: caseCode, urls }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "导入失败");
+    toast(`导入完成，成功 ${data.imported.filter(m => m.fetch_status === "success").length} / ${data.imported.length} 条`);
+    document.getElementById("urlInput").value = "";
+    loadMaterials();
+  } catch (e) {
+    toast("导入出错: " + e.message);
+  } finally {
+    document.getElementById("importLoading").style.display = "none";
+  }
+}
+
+/* ================= 素材库：Word/PDF 上传拆分 ================= */
+function wireDropzone(zoneId, inputId, onFiles) {
+  const zone = document.getElementById(zoneId);
+  const input = document.getElementById(inputId);
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("dragover", e => { e.preventDefault(); zone.classList.add("dragover"); });
+  ["dragleave", "drop"].forEach(evt => zone.addEventListener(evt, e => { e.preventDefault(); zone.classList.remove("dragover"); }));
+  zone.addEventListener("drop", e => { const files = Array.from(e.dataTransfer.files); if (files.length) onFiles(files); });
+  input.addEventListener("change", e => { const files = Array.from(e.target.files); if (files.length) onFiles(files); e.target.value = ""; });
+}
+
+async function uploadFile(file) {
+  const caseCode = document.getElementById("caseCode").value.trim();
+  const dimension = document.getElementById("dimensionSelect").value;
+  if (!caseCode) { toast("请先在顶部填写案例编号"); return; }
+  if (!/\.(docx|pdf)$/i.test(file.name)) { toast("仅支持 .docx 或 .pdf 文件"); return; }
+
+  const formData = new FormData();
+  formData.append("case_code", caseCode);
+  formData.append("dimension", dimension);
+  formData.append("file", file);
+
+  document.getElementById("uploadLoading").style.display = "block";
+  try {
+    const res = await fetch(`${API_BASE}/api/materials/upload`, { method: "POST", body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "上传失败");
+    toast(`《${file.name}》解析完成，拆分出 ${data.segment_count} 条候选案例，已存入素材库`);
+    loadMaterials();
+  } catch (e) {
+    toast("上传出错: " + e.message);
+  } finally {
+    document.getElementById("uploadLoading").style.display = "none";
+  }
+}
+
+/* ================= 素材库：列表 ================= */
+const SOURCE_ICON = { url: "🔗", docx: "📝", pdf: "📄" };
+
+async function loadMaterials() {
+  const caseCode = document.getElementById("caseCode").value.trim();
+  document.getElementById("libCaseCodeLabel").textContent = caseCode || "（未填写）";
+  if (!caseCode) return;
+  const res = await fetch(`${API_BASE}/api/materials?case_code=${encodeURIComponent(caseCode)}`);
+  materialsCache = await res.json();
+  const container = document.getElementById("materialList");
+  if (materialsCache.length === 0) {
+    container.innerHTML = '<div class="empty-hint">暂无素材，请先导入</div>';
+    return;
+  }
+  container.innerHTML = materialsCache.map(m => {
+    const statusClass = m.fetch_status === "success" ? "status-success" : m.fetch_status === "failed" ? "status-failed" : "status-pending";
+    const icon = SOURCE_ICON[m.source_type] || "🔗";
+    const titleHtml = m.url ? `<a href="${escHtml(m.url)}" target="_blank">${escHtml(m.url)}</a>` : escHtml(m.source_title || m.source_filename || "未命名片段");
+    const segLabel = (m.source_type !== "url" && m.segment_index !== null && m.segment_index !== undefined)
+      ? ` <span class="status-badge status-pending">来自《${escHtml(m.source_filename)}》第${m.segment_index + 1}段</span>` : "";
+    return `
+      <div class="material-item">
+        <div class="row1">
+          <input type="checkbox" class="material-checkbox" value="${m.id}"
+            ${selectedMaterialIds.has(m.id) ? "checked" : ""}
+            ${m.fetch_status === "success" ? "" : "disabled"}
+            onchange="toggleSelect(${m.id}, this.checked)">
+          <span class="src-icon">${icon}</span>
+          <span class="title">${titleHtml}</span>
+          <span class="status-badge ${statusClass}">${m.fetch_status}</span>
+        </div>
+        ${segLabel}
+        ${m.fetch_error ? `<div style="color:#b3282d;margin-top:4px;">⚠ ${escHtml(m.fetch_error)}</div>` : ""}
+        ${m.text_preview ? `<div class="preview-text">${escHtml(m.text_preview)}...</div>` : ""}
+        <div class="actions"><button class="link-btn" onclick="openMaterialPreview(${m.id})">🔍 预览全文</button></div>
+      </div>`;
+  }).join("");
+}
+
+function toggleSelect(id, checked) {
+  if (checked) selectedMaterialIds.add(id); else selectedMaterialIds.delete(id);
+}
+
+function openMaterialPreview(id) {
+  const m = materialsCache.find(x => x.id === id);
+  if (!m) return;
+  document.getElementById("previewTitle").textContent = m.source_title || m.url || "素材预览";
+  document.getElementById("previewBody").innerHTML = `<div class="narrative-box">${escHtml(m.full_text || "（无正文内容）")}</div>`;
+  document.getElementById("previewModal").classList.add("active");
+}
+
+function closePreview() {
+  document.getElementById("previewModal").classList.remove("active");
+}
+
+/* ================= 案例库：列表 + 勾选导出Word ================= */
+async function loadCases() {
+  const res = await fetch(`${API_BASE}/api/cases`);
+  casesCache = await res.json();
+  renderCaseList();
+  populateMatchCaseSelect();
+}
+
+function renderCaseList() {
+  const container = document.getElementById("caseLibraryList");
+  if (casesCache.length === 0) {
+    container.innerHTML = '<div class="empty-hint">还没有生成任何案例，先去「💬 AI 助手」生成一个吧</div>';
+    return;
+  }
+  container.innerHTML = casesCache.map(c => `
+    <div class="material-item">
+      <div class="row1">
+        <input type="checkbox" ${selectedCaseIds.has(c.id) ? "checked" : ""} onchange="toggleCaseSelect(${c.id}, this.checked)">
+        <span class="title">案例${escHtml(c.case_code)}：${escHtml(c.title || "(无标题)")}</span>
+        <span class="status-badge status-pending">${escHtml(c.dimension || "")}</span>
+        <span class="case-status status-${c.status}">${c.status}</span>
+      </div>
+      <div class="actions">
+        <button class="link-btn" onclick="openCaseDetail(${c.id})">🔍 查看详情</button>
+        <button class="link-btn" onclick="editInChat(${c.id})">🤖 去AI助手编辑</button>
+      </div>
+    </div>`).join("");
+}
+
+function toggleCaseSelect(id, checked) {
+  if (checked) selectedCaseIds.add(id); else selectedCaseIds.delete(id);
+}
+
+function editInChat(id) {
+  switchView("chat");
+  const input = document.getElementById("chatInput");
+  input.value = `帮我编辑案例ID ${id}：`;
+  input.focus();
+}
+
+async function openCaseDetail(id) {
+  const c = casesCache.find(x => x.id === id);
+  if (!c) return;
+  document.getElementById("previewTitle").textContent = `案例${c.case_code}：${c.title || ""}`;
+  document.getElementById("previewBody").innerHTML = renderCaseDetailHTML(c) +
+    '<div class="section-title">📝 修改记录</div><div class="loading">加载中...</div>';
+  document.getElementById("previewModal").classList.add("active");
+
+  try {
+    const res = await fetch(`${API_BASE}/api/cases/${id}/audit_log`);
+    const logs = await res.json();
+    document.getElementById("previewBody").innerHTML = renderCaseDetailHTML(c) + renderAuditLogHTML(logs);
+  } catch (e) {
+    // 修改记录加载失败不影响案例详情本身的展示，静默即可
+  }
+}
+
+function renderAuditLogHTML(logs) {
+  let html = '<div class="section-title">📝 修改记录</div>';
+  if (!logs || logs.length === 0) {
+    return html + '<div class="empty-hint" style="padding:12px 0;">暂无修改记录</div>';
+  }
+  html += logs.map(log => {
+    const fields = Object.entries(log.changes || {}).map(([field, ch]) =>
+      `<div style="margin:4px 0;"><b>${escHtml(field)}</b>：${escHtml(String(ch.old ?? "(空)").slice(0, 60))} → ${escHtml(String(ch.new ?? "(空)").slice(0, 60))}</div>`
+    ).join("");
+    return `<div style="border-bottom:1px solid var(--border);padding:8px 0;font-size:12.5px;">
+      <div style="color:var(--muted);">${escHtml(log.actor)} · ${escHtml((log.created_at || "").replace("T", " ").slice(0, 19))}</div>
+      ${fields}
+    </div>`;
+  }).join("");
+  return html;
+}
+
+function renderCaseDetailHTML(c) {
+  const to = c.teaching_objectives || {};
+  const se = c.sizheng_elements || {};
+  const td = c.teaching_design || {};
+  const ev = c.evaluation || {};
+  const courses = c.applicable_courses || [];
+  const reading = c.further_reading || [];
+  return `
+    <div class="section-title">① 完整案例</div>
+    <div class="narrative-box">${escHtml(c.full_narrative || "")}</div>
+
+    <div class="section-title">② 案例教学目标</div>
+    <table>
+      <tr><th>知识目标</th><td>${escHtml(to["知识目标"] || "")}</td></tr>
+      <tr><th>能力目标</th><td>${escHtml(to["能力目标"] || "")}</td></tr>
+      <tr><th>素养目标</th><td>${escHtml(to["素养目标"] || "")}</td></tr>
+    </table>
+
+    <div class="section-title">③ 课程思政元素</div>
+    <table>
+      <tr><th>对应维度</th><td>${escHtml(se["对应维度"] || "")}</td></tr>
+      <tr><th>摘录表述</th><td>${escHtml(se["摘录表述"] || "")}</td></tr>
+    </table>
+
+    <div class="section-title">④ 适用课程举例</div>
+    <table>
+      <tr><th>课程名称</th><th>适用章节</th><th>融入方式建议</th></tr>
+      ${courses.map(r => `<tr><td>${escHtml(r["课程名称"] || "")}</td><td>${escHtml(r["适用章节"] || "")}</td><td>${escHtml(r["融入方式建议"] || "")}</td></tr>`).join("")}
+    </table>
+
+    <div class="section-title">⑤ 教学设计</div>
+    <table>
+      <tr><th>课前</th><td>${escHtml(td["课前"] || "")}</td></tr>
+      <tr><th>课中</th><td>${escHtml(td["课中"] || "")}</td></tr>
+      <tr><th>课后</th><td>${escHtml(td["课后"] || "")}</td></tr>
+    </table>
+
+    <div class="section-title">⑥ 课程评价与成效</div>
+    <table>
+      <tr><th>目标达成度</th><td>${escHtml(ev["目标达成度"] || "")}</td></tr>
+      <tr><th>过程参与度</th><td>${escHtml(ev["过程参与度"] || "")}</td></tr>
+      <tr><th>教学反思</th><td>${escHtml(ev["教学反思"] || "")}</td></tr>
+    </table>
+
+    <div class="section-title">⑦ 延伸阅读</div>
+    <table>
+      <tr><th>类型</th><th>标题</th><th>链接</th></tr>
+      ${reading.map(r => `<tr><td>${escHtml(r.type || "")}</td><td>${escHtml(r.title || "")}</td><td><a href="${escHtml(r.url || "")}" target="_blank">${escHtml(r.url || "")}</a></td></tr>`).join("")}
+    </table>
+  `;
+}
+
+async function exportSelectedCases() {
+  const ids = Array.from(selectedCaseIds);
+  if (ids.length === 0) { toast("请先勾选要导出的案例"); return; }
+  try {
+    const res = await fetch(`${API_BASE}/api/cases/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ case_ids: ids }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || `导出失败(${res.status})`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cases_export.docx";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(`已导出 ${ids.length} 个案例`);
+  } catch (e) {
+    toast("导出出错: " + e.message);
+  }
+}
+
+function exportBook() {
+  toast("正在生成成书Word（前言+按维度分章+附录+知识图谱），下载会在浏览器里弹出");
+  window.open(`${API_BASE}/api/book/export?status=已采纳`, "_blank");
+}
+
+/* ================= 知识点匹配 ================= */
+async function loadKnowledgePoints() {
+  const res = await fetch(`${API_BASE}/api/knowledge`);
+  knowledgePointsCache = await res.json();
+  populateCourseFilter();
+  renderKnowledgeList();
+}
+
+function populateCourseFilter() {
+  const sel = document.getElementById("courseFilterSelect");
+  const prev = sel.value;
+  const courses = [...new Set(knowledgePointsCache.map(k => k.course_name))];
+  sel.innerHTML = `<option value="">全部课程（共${knowledgePointsCache.length}条知识点）</option>` +
+    courses.map(c => `<option value="${escHtml(c)}">${escHtml(c)}（${knowledgePointsCache.filter(k => k.course_name === c).length}条）</option>`).join("");
+  if (courses.includes(prev)) sel.value = prev;
+}
+
+function renderKnowledgeList() {
+  const el = document.getElementById("knowledgeList");
+  const filter = document.getElementById("courseFilterSelect").value;
+  const list = filter ? knowledgePointsCache.filter(k => k.course_name === filter) : knowledgePointsCache;
+  if (list.length === 0) {
+    el.innerHTML = '<div class="empty-hint">还没有导入任何知识点，先上传课程教学大纲</div>';
+    return;
+  }
+  el.innerHTML = `<table>
+    <tr><th>课程</th><th>章节</th><th>知识点描述</th><th>来源文件</th></tr>
+    ${list.map(k => `<tr><td>${escHtml(k.course_name)}</td><td>${escHtml(k.chapter || "")}</td><td>${escHtml(k.description)}</td><td style="color:#888;">${escHtml(k.source_filename || "")}</td></tr>`).join("")}
+  </table>`;
+}
+
+async function uploadKnowledgeFiles(files) {
+  const courseName = document.getElementById("courseNameInput").value.trim();
+  const valid = files.filter(f => /\.(docx|pdf)$/i.test(f.name));
+  const invalid = files.filter(f => !/\.(docx|pdf)$/i.test(f.name));
+  if (invalid.length) toast(`已忽略不支持的文件：${invalid.map(f => f.name).join("、")}`);
+  if (valid.length === 0) { toast("请上传 .docx 或 .pdf 文件"); return; }
+
+  const fd = new FormData();
+  if (courseName) fd.append("course_name", courseName);
+  valid.forEach(f => fd.append("files", f));
+
+  document.getElementById("knowledgeUploadLoading").style.display = "block";
+  try {
+    const res = await fetch(`${API_BASE}/api/knowledge/upload`, { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "上传失败");
+    let msg = `解析完成：${valid.length}个文件，共提取到 ${data.count} 条知识点`;
+    if (data.errors && data.errors.length) msg += `；${data.errors.join("；")}`;
+    toast(msg);
+    loadKnowledgePoints();
+  } catch (e) {
+    toast("上传出错: " + e.message);
+  } finally {
+    document.getElementById("knowledgeUploadLoading").style.display = "none";
+  }
+}
+
+function populateMatchCaseSelect() {
+  const sel = document.getElementById("matchCaseSelect");
+  const prevValue = sel.value;
+  sel.innerHTML = casesCache.map(c => `<option value="${c.id}">案例${escHtml(c.case_code)}：${escHtml(c.title || "(无标题)")} [${c.status}]</option>`).join("");
+  if (prevValue) sel.value = prevValue;
+}
+
+async function runMatch() {
+  const caseId = document.getElementById("matchCaseSelect").value;
+  if (!caseId) { toast("请先在「案例库」里生成至少一个案例"); return; }
+  currentMatchCaseId = parseInt(caseId);
+  try {
+    const res = await fetch(`${API_BASE}/api/cases/${caseId}/match_knowledge`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "匹配失败");
+    currentMappings = data.mappings;
+    renderMappingTable();
+    toast(`匹配完成，共 ${data.mappings.length} 条候选`);
+  } catch (e) {
+    toast("匹配出错: " + e.message);
+  }
+}
+
+function renderMappingTable() {
+  const el = document.getElementById("mappingTable");
+  if (!currentMappings || currentMappings.length === 0) {
+    el.innerHTML = '<div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、编辑融入方式建议</div>';
+    return;
+  }
+  el.innerHTML = `<table>
+    <tr><th>知识点</th><th>相关度</th><th>融入方式建议</th><th>状态</th><th></th></tr>
+    ${currentMappings.map(m => `
+      <tr>
+        <td>《${escHtml(m.course_name)}》${escHtml(m.chapter || "")}<br><span style="color:#888">${escHtml(m.description)}</span></td>
+        <td>${m.relevance_score}</td>
+        <td><input type="text" id="sugg_${m.id}" value="${escHtml(m.suggestion_text || "")}"></td>
+        <td>
+          <select id="status_${m.id}">
+            <option value="推荐" ${m.status === "推荐" ? "selected" : ""}>推荐</option>
+            <option value="已采纳" ${m.status === "已采纳" ? "selected" : ""}>已采纳</option>
+            <option value="已拒绝" ${m.status === "已拒绝" ? "selected" : ""}>已拒绝</option>
+          </select>
+        </td>
+        <td><button class="link-btn" onclick="saveMapping(${m.id})">保存</button></td>
+      </tr>`).join("")}
+  </table>`;
+}
+
+async function saveMapping(id) {
+  const status = document.getElementById(`status_${id}`).value;
+  const suggestion_text = document.getElementById(`sugg_${id}`).value;
+  try {
+    const res = await fetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status, suggestion_text }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "保存失败");
+    toast("已保存");
+    const idx = currentMappings.findIndex(m => m.id === id);
+    if (idx >= 0) currentMappings[idx] = data;
+  } catch (e) {
+    toast("保存出错: " + e.message);
+  }
+}
+
+async function enrichCurrentCase() {
+  if (!currentMatchCaseId) { toast("请先选择案例并运行匹配"); return; }
+  try {
+    const res = await fetch(`${API_BASE}/api/cases/${currentMatchCaseId}/enrich`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "补充失败");
+    toast("已根据已采纳的知识点补充「适用课程举例」和「教学设计」，可在「📚 案例库」查看详情确认");
+    loadCases();
+  } catch (e) {
+    toast("补充出错: " + e.message);
+  }
+}
+
+/* ================= 初始化 ================= */
+wireDropzone("dropzone", "fileInput", files => uploadFile(files[0]));
+wireDropzone("knowledgeDropzone", "knowledgeFileInput", uploadKnowledgeFiles);
+loadDimensions();
+renderSuggestions();
+loadSessions();
+</script>
+</body>
+</html>

@@ -1,0 +1,264 @@
+"""
+AI 助手对话代理：用 LangChain 的 create_agent（内部基于 LangGraph）驱动工具调用循环，
+把原来"案例工作台"里手动点按钮做的事情，变成对话里说一句话就能做，
+也能在聊天里直接对素材库做语义检索（不用精确知道case_code/素材ID）。
+
+对外的会话存储格式保持不变（还是 role/content 的简单结构，content可以是字符串，
+也可以是 [{"type":"text"/"tool_use"/"tool_result", ...}] 这种block列表）——
+这样不管内部用什么agent框架，前端的聊天渲染逻辑完全不用跟着改。
+"""
+import json
+
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from langgraph.errors import GraphRecursionError
+
+from db import SessionLocal, RawMaterial, Case, CaseMaterial, DIMENSIONS
+from generate_case import generate_case_draft as _generate_case_draft_impl
+from material_index import search_materials as _search_materials_impl
+from qwen_client import get_langchain_llm, require_api_key, MAX_TOOL_ROUNDS
+from audit import log_case_change
+
+SYSTEM_PROMPT = f"""你是"思政案例生成工作台"的AI助手，帮助用户完成案例草稿的生成与编辑，
+也可以帮用户在素材库里检索相关素材。
+
+严格规则：
+1. 生成或编辑案例正文时，只能使用素材库里已经抓取/上传成功的原始材料里的事实，不能编造任何时间、地点、人物、数据。
+2. 叙事表达必须原创改写，不能照抄原文整段。
+3. 编辑已有案例前，先用 get_case 工具看当前完整内容，只改用户要求的部分，其余字段原样保留（update_case 只需要传你要修改的字段）。
+4. 修改内容后必须调用 update_case 把结果写回数据库，不要只在聊天里描述而不落库。
+5. 如果用户是在描述内容而不是给出具体案例编号/素材ID（比如"有没有关于XX的素材"），用 search_materials 做语义检索，别瞎猜material_id。
+6. 回复用简短的中文说明你做了什么、案例现在是什么状态，不要大段罗列JSON。
+
+可用的思政维度：{", ".join(DIMENSIONS)}
+"""
+
+
+@tool
+def list_materials(case_code: str) -> str:
+    """查询指定案例编号下、已导入素材库的原始素材列表（含抓取状态与正文预览）"""
+    db = SessionLocal()
+    try:
+        materials = db.query(RawMaterial).filter(RawMaterial.case_code == case_code).all()
+        result = [
+            {"id": m.id, "title": m.source_title or m.url, "status": m.fetch_status, "preview": (m.fetched_text or "")[:150]}
+            for m in materials
+        ]
+        return json.dumps({"materials": result}, ensure_ascii=False)
+    finally:
+        db.close()
+
+
+@tool
+def search_materials(query: str, case_code: str = "") -> str:
+    """按自然语言语义检索素材库里的相关内容，适合用户没给出具体素材ID、只描述了个大概内容的场景。
+    case_code留空则搜全部素材库，填了就只搜这个案例编号下的素材"""
+    try:
+        hits = _search_materials_impl(query, top_k=5, case_code=case_code or None)
+        return json.dumps({"hits": hits}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@tool
+def list_cases(case_code: str = "") -> str:
+    """查询案例列表，可按案例编号过滤，返回每个案例的id/标题/状态"""
+    db = SessionLocal()
+    try:
+        query = db.query(Case)
+        if case_code:
+            query = query.filter(Case.case_code == case_code)
+        cases = query.order_by(Case.id.desc()).all()
+        result = [{"id": c.id, "case_code": c.case_code, "title": c.title, "status": c.status} for c in cases]
+        return json.dumps({"cases": result}, ensure_ascii=False)
+    finally:
+        db.close()
+
+
+@tool
+def get_case(case_id: int) -> str:
+    """获取某个案例的完整内容（七段式全部字段），用于编辑前先看清楚现状"""
+    db = SessionLocal()
+    try:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if not case:
+            return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
+        return json.dumps(case.to_dict(), ensure_ascii=False)
+    finally:
+        db.close()
+
+
+@tool
+def generate_case_draft(case_code: str, dimension: str, material_ids: list[int]) -> str:
+    """用指定的素材ID列表，调用模型生成一份新的七段式案例草稿并存入数据库"""
+    db = SessionLocal()
+    try:
+        materials = db.query(RawMaterial).filter(RawMaterial.id.in_(material_ids)).all()
+        success_materials = [m for m in materials if m.fetch_status == "success"]
+        if not success_materials:
+            return json.dumps({"error": "所选素材均不可用（未抓取/解析成功），无法生成"}, ensure_ascii=False)
+        payload = [
+            {"id": m.id, "url": m.url, "title": m.source_title, "text": m.fetched_text}
+            for m in success_materials
+        ]
+        try:
+            draft = _generate_case_draft_impl(case_code, dimension, payload)
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+        case = Case(
+            case_code=case_code,
+            dimension=dimension,
+            title=draft.get("title"),
+            full_narrative=draft.get("full_narrative"),
+            teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
+            sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
+            applicable_courses=json.dumps(draft.get("applicable_courses"), ensure_ascii=False),
+            teaching_design=json.dumps(draft.get("teaching_design"), ensure_ascii=False),
+            evaluation=json.dumps(draft.get("evaluation"), ensure_ascii=False),
+            further_reading=json.dumps(draft.get("further_reading"), ensure_ascii=False),
+            status="待审核",
+        )
+        db.add(case)
+        db.commit()
+        db.refresh(case)
+        for m in success_materials:
+            db.add(CaseMaterial(case_id=case.id, material_id=m.id))
+        db.commit()
+        log_case_change(db, case.id, "AI助手", {"__created__": {"old": None, "new": "generate_case_draft"}})
+        return json.dumps(case.to_dict(), ensure_ascii=False)
+    finally:
+        db.close()
+
+
+@tool
+def update_case(
+    case_id: int,
+    title: str = None,
+    full_narrative: str = None,
+    teaching_objectives: dict = None,
+    sizheng_elements: dict = None,
+    applicable_courses: list = None,
+    teaching_design: dict = None,
+    evaluation: dict = None,
+    further_reading: list = None,
+    status: str = None,
+) -> str:
+    """更新某个案例的字段（比如修改标题、完整案例正文、教学设计等），只传需要修改的字段。
+    status 取值范围：草稿/待审核/已采纳/已驳回"""
+    db = SessionLocal()
+    try:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if not case:
+            return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
+
+        fields = {
+            "title": title, "full_narrative": full_narrative,
+            "teaching_objectives": teaching_objectives, "sizheng_elements": sizheng_elements,
+            "applicable_courses": applicable_courses, "teaching_design": teaching_design,
+            "evaluation": evaluation, "further_reading": further_reading, "status": status,
+        }
+        changes = {}
+        for field, value in fields.items():
+            if value is None:
+                continue
+            old_value = getattr(case, field, None)
+            new_value = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+            if old_value != new_value:
+                changes[field] = {"old": old_value, "new": new_value}
+            setattr(case, field, new_value)
+
+        db.commit()
+        db.refresh(case)
+        if changes:
+            log_case_change(db, case.id, "AI助手", changes)
+        return json.dumps(case.to_dict(), ensure_ascii=False)
+    finally:
+        db.close()
+
+
+TOOLS = [list_materials, search_materials, list_cases, get_case, generate_case_draft, update_case]
+
+_agent = None
+
+
+def _get_agent():
+    global _agent
+    if _agent is None:
+        _agent = create_agent(get_langchain_llm(), tools=TOOLS, system_prompt=SYSTEM_PROMPT)
+    return _agent
+
+
+def _to_langchain_messages(stored: list[dict]) -> list:
+    """把我们自己的稳定存储格式（前端认的那套）转成LangChain消息对象"""
+    messages = []
+    for m in stored:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "user":
+            if isinstance(content, str):
+                messages.append(HumanMessage(content=content))
+            else:
+                for block in content or []:
+                    if block.get("type") == "tool_result":
+                        messages.append(ToolMessage(content=block.get("content", ""), tool_call_id=block.get("tool_use_id", "")))
+        elif role == "assistant":
+            blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+            text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            tool_calls = [
+                {"name": b["name"], "args": b.get("input", {}), "id": b["id"]}
+                for b in blocks if b.get("type") == "tool_use"
+            ]
+            messages.append(AIMessage(content=text, tool_calls=tool_calls))
+    return messages
+
+
+def _from_langchain_messages(messages: list) -> list[dict]:
+    """把LangChain消息对象转回我们自己的稳定存储格式，前端的聊天渲染逻辑靠的就是这个格式"""
+    stored = []
+    for msg in messages:
+        if msg.type == "human":
+            stored.append({"role": "user", "content": msg.content})
+        elif msg.type == "ai":
+            blocks = []
+            if msg.content:
+                blocks.append({"type": "text", "text": msg.content})
+            for tc in (msg.tool_calls or []):
+                blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["args"]})
+            stored.append({"role": "assistant", "content": blocks})
+        elif msg.type == "tool":
+            stored.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": msg.tool_call_id, "content": msg.content}],
+            })
+    return stored
+
+
+def run_chat(stored_messages: list[dict], user_message: str) -> dict:
+    """
+    stored_messages: 上一轮持久化下来的对话历史（我们自己的稳定格式）
+    user_message: 这一轮用户新说的话（已经带上了案例编号/维度这类隐藏上下文前缀）
+    返回 {"messages": 追加了本轮的完整历史(同样是我们自己的格式), "reply": 最后一条assistant文本}
+    """
+    require_api_key()
+
+    history = _to_langchain_messages(stored_messages) if stored_messages else []
+    history.append(HumanMessage(content=user_message))
+
+    try:
+        result = _get_agent().invoke(
+            {"messages": history},
+            config={"recursion_limit": MAX_TOOL_ROUNDS * 2 + 1},
+        )
+        updated_messages = result["messages"]
+        reply = ""
+        for msg in reversed(updated_messages):
+            if msg.type == "ai" and msg.content:
+                reply = msg.content
+                break
+    except GraphRecursionError:
+        updated_messages = history
+        reply = "（工具调用次数过多，已中止，请换个更具体的说法重试）"
+
+    return {"messages": _from_langchain_messages(updated_messages), "reply": reply}

@@ -1,0 +1,6 @@
+backend/.venv/
+backend/.env
+backend/__pycache__/
+backend/sizheng_cases.db
+*.pyc
+.DS_Store

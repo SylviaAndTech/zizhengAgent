@@ -1,0 +1,34 @@
+# 开发环境用：MySQL + ChromaDB
+# 端口和账号密码要跟 backend/.env 里的 DB_*/CHROMA_* 对上
+# 启动：docker compose up -d
+# 停止：docker compose down（加 -v 会把下面的数据卷也删掉，谨慎）
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: sizheng-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: sizheng_cases
+      MYSQL_USER: sizheng
+      MYSQL_PASSWORD: sizheng_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./volumes/mysql:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  chroma:
+    # backend/requirements.txt里锁定的客户端是 chromadb==1.5.9，
+    # 装的时候如果Docker Hub上有更新的1.5.x/1.6.x正式版，换成那个通常更保险，能连上就行。
+    image: chromadb/chroma:1.5.9
+    container_name: sizheng-chroma
+    restart: unless-stopped
+    volumes:
+      - ./volumes/chroma:/data
+    ports:
+      - "8001:8000"   # 容器内固定用8000；backend/.env里的CHROMA_PORT=8001要跟这里的host端口对上
+    # 8000被咱们自己的FastAPI后端占了，所以这里特意映射成host的8001，避免端口冲突。
+    # 如果这个镜像版本的持久化路径/环境变量跟这里写的对不上（Chroma的Docker镜像偶尔会调整），
+    # 以 https://hub.docker.com/r/chromadb/chroma 当时的说明为准。
