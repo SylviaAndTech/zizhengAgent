@@ -22,9 +22,13 @@ def _extract_json(raw_text: str) -> dict:
 
 
 def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
-    """调用Qwen，要求输出JSON对象；DashScope兼容模式支持response_format强制JSON输出"""
+    """调用Qwen，要求输出JSON对象；DashScope兼容模式支持response_format强制JSON输出。
+    用stream=True请求，避免生成内容较长时模型思考耗时过长、连接被中间层判定超时挂断；
+    但这里的返回值本来就要整体丢给json.loads解析，用户也看不到逐字输出的过程
+    （这个函数是被案例生成/知识点补充接口和AI助手的工具调用在后台使用，不是聊天窗口直接展示的内容），
+    所以流式只用来提高请求稳定性，还是要把所有chunk拼完整再解析。"""
     try:
-        response = get_client().chat.completions.create(
+        stream = get_client().chat.completions.create(
             model=CHAT_MODEL,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
@@ -32,11 +36,15 @@ def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            stream=True,
+        )
+        raw_text = "".join(
+            chunk.choices[0].delta.content or ""
+            for chunk in stream
+            if chunk.choices
         )
     except openai.APIError as e:
-        raise ValueError(f"调用 Qwen API 失败: {str(e)}")
-
-    raw_text = response.choices[0].message.content or ""
+        raise ValueError(f"调用 API 失败: {str(e)}")
 
     try:
         return _extract_json(raw_text)

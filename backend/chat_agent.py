@@ -235,30 +235,70 @@ def _from_langchain_messages(messages: list) -> list[dict]:
     return stored
 
 
-def run_chat(stored_messages: list[dict], user_message: str) -> dict:
+def stream_chat(stored_messages: list[dict], user_message: str):
     """
-    stored_messages: 上一轮持久化下来的对话历史（我们自己的稳定格式）
-    user_message: 这一轮用户新说的话（已经带上了案例编号/维度这类隐藏上下文前缀）
-    返回 {"messages": 追加了本轮的完整历史(同样是我们自己的格式), "reply": 最后一条assistant文本}
+    流式版对话：逐token把AI助手正在生成的文字yield出去，供接口边生成边推给前端（打字机效果），
+    而不是等模型把整轮工具调用+回复都跑完才一次性返回。
+
+    用LangGraph的双模式流：
+    - stream_mode="messages" 拿到的是模型节点逐token吐出的AIMessageChunk，用来做实时展示；
+    - stream_mode="values" 拿到的是每个步骤结束后的完整图状态（含工具调用/工具结果），
+      用它的最后一次取值作为最终要落库的完整对话历史——这样不用自己拼工具调用参数/结果，
+      直接复用和非流式版一样的、LangGraph已经组装好的准确状态。
+
+    yield出的事件：
+      {"type": "token", "text": ...}                          —— 增量文本，直接拼到当前气泡上
+      {"type": "tool_call", "name": ...}                       —— 检测到一次工具调用，前端展示一个工具chip
+      {"type": "done", "messages": [...], "reply": ...}        —— 流结束，附最终要落库的完整历史
+      {"type": "error", "message": ...}                        —— 出错，调用方决定要不要落库当前进度
     """
     require_api_key()
 
     history = _to_langchain_messages(stored_messages) if stored_messages else []
     history.append(HumanMessage(content=user_message))
 
+    final_state = None
+    seen_tool_call_ids = set()
+
     try:
-        result = _get_agent().invoke(
+        for mode, chunk in _get_agent().stream(
             {"messages": history},
             config={"recursion_limit": MAX_TOOL_ROUNDS * 2 + 1},
-        )
-        updated_messages = result["messages"]
-        reply = ""
-        for msg in reversed(updated_messages):
-            if msg.type == "ai" and msg.content:
-                reply = msg.content
-                break
-    except GraphRecursionError:
-        updated_messages = history
-        reply = "（工具调用次数过多，已中止，请换个更具体的说法重试）"
+            stream_mode=["messages", "values"],
+        ):
+            if mode == "values":
+                final_state = chunk
+                continue
 
-    return {"messages": _from_langchain_messages(updated_messages), "reply": reply}
+            # mode == "messages"：chunk 是 (message_chunk, metadata)
+            msg_chunk, meta = chunk
+            if meta.get("langgraph_node") != "model":
+                continue  # 跳过tools节点吐出的ToolMessage整块内容，那个不是给用户逐字看的
+
+            content = getattr(msg_chunk, "content", None)
+            if content:
+                yield {"type": "token", "text": content}
+
+            for tc in (getattr(msg_chunk, "tool_call_chunks", None) or []):
+                tc_id = tc.get("id")
+                name = tc.get("name")
+                if name and tc_id and tc_id not in seen_tool_call_ids:
+                    seen_tool_call_ids.add(tc_id)
+                    yield {"type": "tool_call", "name": name}
+    except GraphRecursionError:
+        reply = "（工具调用次数过多，已中止，请换个更具体的说法重试）"
+        yield {"type": "token", "text": reply}
+        yield {"type": "done", "messages": _from_langchain_messages(history), "reply": reply}
+        return
+    except Exception as e:
+        yield {"type": "error", "message": str(e)}
+        return
+
+    updated_messages = final_state["messages"] if final_state else history
+    reply = ""
+    for msg in reversed(updated_messages):
+        if msg.type == "ai" and msg.content:
+            reply = msg.content
+            break
+
+    yield {"type": "done", "messages": _from_langchain_messages(updated_messages), "reply": reply}

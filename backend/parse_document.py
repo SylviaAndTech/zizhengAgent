@@ -7,7 +7,9 @@ import io
 import re
 
 import docx
-from pypdf import PdfReader
+import fitz  # PyMuPDF
+
+from ocr_utils import doc_is_scanned, ocr_document_plain_text
 
 # 常见的案例/条目标题模式：如 "案例3.4"、"3.4 DeepSeek..."、"（一）..."、"一、..."
 HEADING_PATTERNS = [
@@ -41,17 +43,33 @@ def extract_text_from_docx(file_bytes: bytes) -> list[tuple[str, bool]]:
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> list[tuple[str, bool]]:
-    """PDF没有样式信息，只能靠文本规则判断是否像标题"""
-    reader = PdfReader(io.BytesIO(file_bytes))
-    lines = []
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        for raw_line in page_text.split("\n"):
-            text = raw_line.strip()
-            if not text:
-                continue
-            lines.append((text, _looks_like_heading(text)))
-    return lines
+    """PDF没有样式信息，只能靠文本规则判断是否像标题。
+    用PyMuPDF而不是pypdf：pypdf对国产办公软件导出的中文PDF（自定义CID字体编码）经常提取出
+    乱码或大段丢字，PyMuPDF的字体/编码解析明显更稳，是目前公认解决中文PDF乱码问题的主流方案。"""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        if doc.needs_pass and not doc.authenticate(""):
+            raise ValueError("PDF已加密，无法在没有密码的情况下解析")
+
+        if doc_is_scanned(doc):
+            # 扫描件（整页是图片，没有文字层），文本抽取拿不到任何内容，走OCR兜底
+            try:
+                raw_lines = ocr_document_plain_text(doc)
+            except Exception as e:
+                raise ValueError(f"这是一份扫描版PDF（没有文字层），OCR识别失败: {e}") from e
+            return [(text, _looks_like_heading(text)) for text in raw_lines]
+
+        lines = []
+        for page in doc:
+            page_text = page.get_text("text") or ""
+            for raw_line in page_text.split("\n"):
+                text = raw_line.strip()
+                if not text:
+                    continue
+                lines.append((text, _looks_like_heading(text)))
+        return lines
+    finally:
+        doc.close()
 
 
 def split_into_cases(lines: list[tuple[str, bool]]) -> list[dict]:

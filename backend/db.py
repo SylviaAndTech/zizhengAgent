@@ -6,12 +6,14 @@
 """
 import datetime
 import json
+import logging
 import os
 
 from dotenv import load_dotenv
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, text
 )
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 load_dotenv()
@@ -42,7 +44,7 @@ class RawMaterial(Base):
     case_code = Column(String(20), index=True)  # 如 "3.4"
     url = Column(Text, nullable=True)  # 上传文件拆分出的素材没有URL
     source_title = Column(Text)  # 用户粘贴时附带的原始标题，或从文档中拆分出的段落标题
-    fetched_text = Column(Text)  # 抓取/提取到的正文快照，供追溯核实
+    fetched_text = Column(LONGTEXT)  # 抓取/提取到的正文快照（保留全文，不做截断），供追溯核实
     fetch_status = Column(String(20), default="pending")  # pending/success/failed
     fetch_error = Column(Text, nullable=True)
     source_type = Column(String(10), default="url")  # url/docx/pdf
@@ -200,6 +202,17 @@ class CaseAuditLog(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _migrate_fetched_text_to_longtext()
+
+
+def _migrate_fetched_text_to_longtext():
+    """create_all不会修改已存在表的列类型；旧库的fetched_text可能还是TEXT(65535字节上限，
+    正文长一点的网页会被截断)，这里补一次ALTER把它放宽到LONGTEXT。已经是LONGTEXT时该语句是空操作。"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE raw_materials MODIFY COLUMN fetched_text LONGTEXT"))
+    except Exception as e:
+        logging.getLogger("uvicorn.error").warning(f"fetched_text列类型迁移失败（不影响启动）: {e}")
 
 
 def get_db():

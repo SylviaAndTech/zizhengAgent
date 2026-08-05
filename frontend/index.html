@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <title>思政案例生成工作台 - 原型</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <style>
   :root {
     --primary: #b3282d;
@@ -97,10 +99,26 @@
   .chat-wrap { display: flex; flex-direction: column; height: calc(100vh - 140px); flex: 1; min-width: 0; }
   .chat-messages { flex: 1; overflow-y: auto; padding: 14px 4px; display: flex; flex-direction: column; gap: 12px; }
   .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
-  .msg.assistant { background: var(--card-bg); border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 2px; }
+  .msg.assistant { background: var(--card-bg); border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 2px; white-space: normal; }
   .msg.user { background: var(--primary); color: white; align-self: flex-end; border-bottom-right-radius: 2px; }
   .msg .meta { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
   .msg.user .meta { color: #f3d9da; }
+  /* AI回复用marked渲染出的markdown内容排版 */
+  .msg.assistant p { margin: 0 0 8px; }
+  .msg.assistant p:last-child { margin-bottom: 0; }
+  .msg.assistant ul, .msg.assistant ol { margin: 4px 0 8px; padding-left: 20px; }
+  .msg.assistant li { margin: 2px 0; }
+  .msg.assistant h1, .msg.assistant h2, .msg.assistant h3, .msg.assistant h4 { font-size: 14.5px; margin: 10px 0 6px; }
+  .msg.assistant h1:first-child, .msg.assistant h2:first-child, .msg.assistant h3:first-child { margin-top: 0; }
+  .msg.assistant code { background: #f0ece7; padding: 1px 5px; border-radius: 3px; font-size: 12.5px; }
+  .msg.assistant pre { background: #f5f3f0; padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+  .msg.assistant pre code { background: none; padding: 0; }
+  .msg.assistant blockquote { border-left: 3px solid var(--border); margin: 6px 0; padding: 2px 10px; color: var(--muted); }
+  .msg.assistant table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 13px; display: block; overflow-x: auto; }
+  .msg.assistant th, .msg.assistant td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; }
+  .msg.assistant th { background: #f0ece7; }
+  .msg.assistant a { color: var(--primary-dark); }
+  .msg.assistant strong { font-weight: 700; }
   .tool-chip {
     align-self: center; background: #f0ece7; color: #8a817a; font-size: 11px;
     padding: 3px 10px; border-radius: 10px;
@@ -126,6 +144,7 @@
   .material-item .src-icon { font-size: 15px; }
   .material-item .title { color: var(--text); word-break: break-all; flex: 1; }
   .material-item .title a { color: var(--primary-dark); }
+  .material-item .title .src-link { display: block; color: var(--muted); font-size: 11px; font-weight: normal; margin-top: 2px; word-break: break-all; }
   .status-badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
   .status-success { background: #e6f2e6; color: var(--success); }
   .status-failed { background: #fbeaea; color: var(--danger); }
@@ -162,6 +181,21 @@
   .modal-box .modal-header h3 { margin: 0; font-size: 15px; }
   .modal-box .modal-body { padding: 16px 18px; overflow-y: auto; font-size: 13px; line-height: 1.8; }
   .modal-close { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; margin: 0; }
+
+  /* ---------- 案例正文里的句级引用角标 + hover预览 ---------- */
+  .cite {
+    display: inline-block; color: var(--primary); font-size: 11px; font-weight: 700;
+    cursor: pointer; padding: 0 2px; vertical-align: super; line-height: 1;
+  }
+  .cite:hover { text-decoration: underline; }
+  .cite-tooltip {
+    display: none; position: fixed; z-index: 1100; max-width: 360px; background: #2b2622; color: #f4f1ec;
+    border-radius: 8px; padding: 10px 12px; font-size: 12.5px; line-height: 1.7; box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+  }
+  .cite-tooltip.active { display: block; }
+  .cite-tooltip .ct-title { font-weight: 700; margin-bottom: 4px; color: #fff; }
+  .cite-tooltip .ct-snippet mark { background: #b3282d; color: #fff; border-radius: 2px; padding: 0 2px; }
+  .cite-tooltip .ct-hint { color: #b7afa3; margin-top: 4px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -172,8 +206,8 @@
     <div class="subtitle">素材导入 → AI助手对话生成/编辑 → 案例库审核导出 → 知识点匹配补充 | 原型 v0.3</div>
   </div>
   <div class="context-bar">
-    <span>素材导入上下文</span>
-    <input type="text" id="caseCode" value="3.4" title="案例编号，用于素材库导入分组和AI助手默认上下文">
+    <span>AI助手默认上下文</span>
+    <input type="text" id="caseCode" placeholder="如 3.4（可留空）" title="案例编号，AI助手对话时的默认上下文；从素材库勾选素材生成案例草稿时会自动同步成素材实际所属的案例编号">
     <select id="dimensionSelect"></select>
   </div>
 </div>
@@ -207,8 +241,14 @@
 <!-- ============ 视图二：素材库 ============ -->
 <div class="view" id="view-library">
   <div class="card">
+    <h2>本次导入归入哪个案例</h2>
+    <label>案例编号（可自行修改；默认取现有最大编号+1，方便新开一个案例）</label>
+    <input type="text" id="materialCaseCode" placeholder="如 3.5" style="max-width:160px;">
+  </div>
+
+  <div class="card">
     <h2>方式一：粘贴 URL 批量抓取</h2>
-    <label>粘贴URL（每行一个，会归入上方「素材导入上下文」的案例编号）</label>
+    <label>粘贴URL（每行一个，会归入上方案例编号）</label>
     <textarea id="urlInput" rows="4" placeholder="https://news.qq.com/rain/a/xxxx&#10;https://www.sohu.com/a/xxxx"></textarea>
     <button onclick="importMaterials()">抓取并导入素材</button>
     <div id="importLoading" class="loading" style="display:none;">正在抓取，请稍候...</div>
@@ -226,10 +266,27 @@
 
   <div class="card">
     <div class="top-bar">
-      <h2 style="margin:0;border:none;">素材库（当前案例：<span id="libCaseCodeLabel"></span>）</h2>
+      <h2 style="margin:0;border:none;">素材库</h2>
       <button class="secondary" style="margin:0;" onclick="loadMaterials()">刷新</button>
     </div>
-    <div id="materialList"><div class="empty-hint">暂无素材，请先导入</div></div>
+    <div class="inline-row" style="margin-top:6px;">
+      <div>
+        <label>按案例编号筛选</label>
+        <select id="materialCaseFilter" onchange="loadMaterials()"><option value="">全部案例</option></select>
+      </div>
+      <div>
+        <label>搜索（标题 / URL / 正文关键词）</label>
+        <input type="text" id="materialSearchInput" placeholder="输入关键词后回车" onkeydown="if(event.key==='Enter'){loadMaterials();}">
+      </div>
+    </div>
+    <div class="top-bar" style="margin-top:10px;">
+      <div style="font-size:13px;color:var(--muted);">已勾选 <span id="selectedMaterialCount">0</span> 条</div>
+      <div>
+        <button class="secondary" style="margin:0;" onclick="selectAllMaterials()">☑ 全选当前列表</button>
+        <button class="secondary" style="margin:0;" onclick="clearMaterialSelection()">☐ 清空勾选</button>
+      </div>
+    </div>
+    <div id="materialList" style="margin-top:10px;"><div class="empty-hint">暂无素材，请先导入</div></div>
     <button onclick="sendSelectedToAgent()">🤖 用勾选素材，去「AI助手」生成案例草稿</button>
   </div>
 </div>
@@ -243,9 +300,10 @@
         <button class="secondary" style="margin:0;" onclick="loadCases()">刷新</button>
         <button class="secondary" style="margin:0;" onclick="exportBook()">📖 导出成书（前言+按维度分章+附录+图谱）</button>
         <button style="margin:0;" onclick="exportSelectedCases()">⬇️ 导出勾选为 Word</button>
+        <button style="margin:0;background:var(--danger);" onclick="deleteSelectedCases()">🗑 删除勾选案例</button>
       </div>
     </div>
-    <div class="chat-hint" style="text-align:left;padding:8px 0 0;">案例内容的生成与逐段修改请到「💬 AI 助手」标签页用对话完成；这里主要用来审阅、勾选、批量导出。</div>
+    <div class="chat-hint" style="text-align:left;padding:8px 0 0;">可以在这里直接编辑案例内容，也可以去「💬 AI 助手」标签页用对话完成生成/修改。</div>
     <div id="caseLibraryList" style="margin-top:10px;"><div class="empty-hint">还没有生成任何案例，先去「💬 AI 助手」生成一个吧</div></div>
   </div>
 </div>
@@ -316,8 +374,10 @@
   </div>
 </div>
 
+<div class="cite-tooltip" id="citeTooltip"></div>
+
 <script>
-const API_BASE = "http://localhost:8000";
+const API_BASE = "http://localhost:8082";
 
 let materialsCache = [];
 let selectedMaterialIds = new Set();
@@ -349,7 +409,7 @@ function switchView(name) {
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
   document.getElementById(`view-${name}`).classList.add("active");
   document.querySelector(`.tab-btn[data-view="${name}"]`).classList.add("active");
-  if (name === "library") loadMaterials();
+  if (name === "library") { loadMaterialCaseCodes().then(loadMaterials); }
   if (name === "caselibrary") loadCases();
   if (name === "knowledge") { loadKnowledgePoints(); loadCases(); }
 }
@@ -372,10 +432,18 @@ function stripContextPrefix(text) {
   return text.replace(/^\[当前案例编号[^\]]*\]\n/, "");
 }
 
+function renderMessageBody(role, text) {
+  if (role === "assistant" && window.marked && window.DOMPurify) {
+    const html = marked.parse(text, { breaks: true, gfm: true });
+    return DOMPurify.sanitize(html);
+  }
+  return escHtml(text);
+}
+
 function addBubble(container, role, text) {
   const div = document.createElement("div");
   div.className = `msg ${role}`;
-  div.innerHTML = `<span class="meta">${role === "user" ? "你" : "AI 助手"}</span>${escHtml(text)}`;
+  div.innerHTML = `<span class="meta">${role === "user" ? "你" : "AI 助手"}</span>${renderMessageBody(role, text)}`;
   container.appendChild(div);
 }
 
@@ -494,25 +562,78 @@ async function sendChat(overrideText) {
   renderChatMessages();
   setChatLoading(true);
 
+  const box = document.getElementById("chatMessages");
+  let streamText = "";
+  let streamBubble = null;
+
+  const flushBubble = () => {
+    // 每次工具调用之间要开新气泡：agent一轮里可能是"说一段话→调工具→再说一段话"，
+    // 不重置的话工具chip前后的文字会被拼进同一个气泡，顺序看着就乱了
+    streamText = "";
+    streamBubble = null;
+  };
+
   try {
     const res = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: currentSessionId, message: rawText, case_code: caseCode, dimension }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "AI助手出错");
-    chatHistory = data.session.messages;
-
-    const idx = sessionsCache.findIndex(s => s.id === currentSessionId);
-    if (idx >= 0) {
-      const [item] = sessionsCache.splice(idx, 1);
-      item.title = data.session.title;
-      item.updated_at = data.session.updated_at;
-      item.message_count = chatHistory.length;
-      sessionsCache.unshift(item);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || "AI助手出错");
     }
-    renderSessionList();
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop(); // 最后一段可能不完整，留到下一轮读到的数据里接着拼
+
+      for (const frame of frames) {
+        const line = frame.trim();
+        if (!line.startsWith("data:")) continue;
+        const payload = JSON.parse(line.slice(5).trim());
+
+        if (payload.type === "token") {
+          streamText += payload.text;
+          if (!streamBubble) {
+            streamBubble = document.createElement("div");
+            streamBubble.className = "msg assistant";
+            box.appendChild(streamBubble);
+          }
+          streamBubble.innerHTML = `<span class="meta">AI 助手</span>${renderMessageBody("assistant", streamText)}`;
+          box.scrollTop = box.scrollHeight;
+        } else if (payload.type === "tool_call") {
+          flushBubble();
+          addToolChip(box, `🔧 调用工具：${payload.name}`);
+          box.scrollTop = box.scrollHeight;
+        } else if (payload.type === "error") {
+          throw new Error(payload.message);
+        } else if (payload.type === "done") {
+          chatHistory = payload.messages;
+          if (payload.session) {
+            const idx = sessionsCache.findIndex(s => s.id === currentSessionId);
+            if (idx >= 0) {
+              const [item] = sessionsCache.splice(idx, 1);
+              item.title = payload.session.title;
+              item.updated_at = payload.session.updated_at;
+              item.message_count = chatHistory.length;
+              sessionsCache.unshift(item);
+            }
+            renderSessionList();
+          }
+        }
+      }
+    }
+
+    // 流结束后用后端落库的完整历史整体重渲染一遍：既能保证工具调用/文本的顺序和存储结构完全一致，
+    // 也能让markdown按完整文本重新解析一次（流式过程中片段化的markdown可能渲染得不完整，比如没读完的表格）
     renderChatMessages();
   } catch (e) {
     chatHistory.push({ role: "assistant", content: `⚠ ${e.message}` });
@@ -523,13 +644,29 @@ async function sendChat(overrideText) {
 }
 
 function sendSelectedToAgent() {
-  const caseCode = document.getElementById("caseCode").value.trim();
   const dimension = document.getElementById("dimensionSelect").value;
   const ids = Array.from(selectedMaterialIds);
   if (ids.length === 0) {
     toast("请先在素材库里勾选至少一条抓取/解析成功的素材");
     return;
   }
+
+  // 案例编号必须跟着勾选的素材走，不能用顶部那个可能完全无关的默认输入框——
+  // 之前就是因为这里读顶部#caseCode（默认值"3.4"没人特意去改），导致不管勾的是哪个案例的素材，
+  // 发给AI的案例编号永远是3.4
+  const selectedMaterials = materialsCache.filter(m => selectedMaterialIds.has(m.id));
+  const caseCodes = [...new Set(selectedMaterials.map(m => m.case_code).filter(Boolean))];
+  if (caseCodes.length === 0) {
+    toast("勾选的素材没有案例编号，请重新导入");
+    return;
+  }
+  if (caseCodes.length > 1) {
+    toast(`勾选的素材分属多个案例编号（${caseCodes.join("、")}），请只勾选同一个案例下的素材再生成`);
+    return;
+  }
+  const caseCode = caseCodes[0];
+  document.getElementById("caseCode").value = caseCode; // 同步顶部AI助手上下文，避免文案里说的案例编号和实际发给AI的上下文对不上
+
   switchView("chat");
   sendChat(`请用素材ID ${JSON.stringify(ids)} 生成案例${caseCode}的初稿，思政维度是"${dimension}"。`);
 }
@@ -544,7 +681,7 @@ async function loadDimensions() {
 
 /* ================= 素材库：URL 导入 ================= */
 async function importMaterials() {
-  const caseCode = document.getElementById("caseCode").value.trim();
+  const caseCode = document.getElementById("materialCaseCode").value.trim();
   const urls = document.getElementById("urlInput").value.split("\n").map(u => u.trim()).filter(Boolean);
   if (!caseCode || urls.length === 0) {
     toast("请填写案例编号并粘贴至少一个URL");
@@ -559,8 +696,12 @@ async function importMaterials() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "导入失败");
-    toast(`导入完成，成功 ${data.imported.filter(m => m.fetch_status === "success").length} / ${data.imported.length} 条`);
+    const dupCount = data.imported.filter(m => m.duplicate).length;
+    const okCount = data.imported.filter(m => m.fetch_status === "success" && !m.duplicate).length;
+    const dupHint = dupCount ? `，其中 ${dupCount} 条已存在于素材库，未重复导入` : "";
+    toast(`导入完成，新增成功 ${okCount} / ${data.imported.length} 条${dupHint}`);
     document.getElementById("urlInput").value = "";
+    await loadMaterialCaseCodes();
     loadMaterials();
   } catch (e) {
     toast("导入出错: " + e.message);
@@ -581,9 +722,9 @@ function wireDropzone(zoneId, inputId, onFiles) {
 }
 
 async function uploadFile(file) {
-  const caseCode = document.getElementById("caseCode").value.trim();
+  const caseCode = document.getElementById("materialCaseCode").value.trim();
   const dimension = document.getElementById("dimensionSelect").value;
-  if (!caseCode) { toast("请先在顶部填写案例编号"); return; }
+  if (!caseCode) { toast("请先填写素材所属的案例编号"); return; }
   if (!/\.(docx|pdf)$/i.test(file.name)) { toast("仅支持 .docx 或 .pdf 文件"); return; }
 
   const formData = new FormData();
@@ -597,6 +738,7 @@ async function uploadFile(file) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "上传失败");
     toast(`《${file.name}》解析完成，拆分出 ${data.segment_count} 条候选案例，已存入素材库`);
+    await loadMaterialCaseCodes();
     loadMaterials();
   } catch (e) {
     toast("上传出错: " + e.message);
@@ -607,14 +749,39 @@ async function uploadFile(file) {
 
 /* ================= 素材库：列表 ================= */
 const SOURCE_ICON = { url: "🔗", docx: "📝", pdf: "📄" };
+const SIX_DIMENSIONS = ["家国情怀", "人文素养", "科学精神", "深度学习", "人格发展", "实践创新"];
+
+async function loadMaterialCaseCodes() {
+  const res = await fetch(`${API_BASE}/api/materials/case_codes`);
+  const data = await res.json();
+
+  const filterSel = document.getElementById("materialCaseFilter");
+  const currentFilter = filterSel.value;
+  filterSel.innerHTML = '<option value="">全部案例</option>' +
+    data.case_codes.map(c => `<option value="${escHtml(c)}">${escHtml(c)}</option>`).join("");
+  if (data.case_codes.includes(currentFilter)) filterSel.value = currentFilter;
+
+  const codeInput = document.getElementById("materialCaseCode");
+  if (!codeInput.value.trim() && data.next_case_code) {
+    codeInput.value = data.next_case_code;
+  }
+}
 
 async function loadMaterials() {
-  const caseCode = document.getElementById("caseCode").value.trim();
-  document.getElementById("libCaseCodeLabel").textContent = caseCode || "（未填写）";
-  if (!caseCode) return;
-  const res = await fetch(`${API_BASE}/api/materials?case_code=${encodeURIComponent(caseCode)}`);
+  const caseCode = document.getElementById("materialCaseFilter").value.trim();
+  const q = document.getElementById("materialSearchInput").value.trim();
+  const params = new URLSearchParams();
+  if (caseCode) params.set("case_code", caseCode);
+  if (q) params.set("q", q);
+
+  const res = await fetch(`${API_BASE}/api/materials?${params.toString()}`);
   materialsCache = await res.json();
+  renderMaterialList();
+}
+
+function renderMaterialList() {
   const container = document.getElementById("materialList");
+  updateSelectedMaterialCount();
   if (materialsCache.length === 0) {
     container.innerHTML = '<div class="empty-hint">暂无素材，请先导入</div>';
     return;
@@ -622,7 +789,8 @@ async function loadMaterials() {
   container.innerHTML = materialsCache.map(m => {
     const statusClass = m.fetch_status === "success" ? "status-success" : m.fetch_status === "failed" ? "status-failed" : "status-pending";
     const icon = SOURCE_ICON[m.source_type] || "🔗";
-    const titleHtml = m.url ? `<a href="${escHtml(m.url)}" target="_blank">${escHtml(m.url)}</a>` : escHtml(m.source_title || m.source_filename || "未命名片段");
+    const displayTitle = m.source_title || m.source_filename || (m.url ? "（未识别到标题）" : "未命名片段");
+    const titleHtml = `${escHtml(displayTitle)}${m.url ? ` <a href="${escHtml(m.url)}" target="_blank" class="src-link">${escHtml(m.url)}</a>` : ""}`;
     const segLabel = (m.source_type !== "url" && m.segment_index !== null && m.segment_index !== undefined)
       ? ` <span class="status-badge status-pending">来自《${escHtml(m.source_filename)}》第${m.segment_index + 1}段</span>` : "";
     return `
@@ -633,19 +801,54 @@ async function loadMaterials() {
             ${m.fetch_status === "success" ? "" : "disabled"}
             onchange="toggleSelect(${m.id}, this.checked)">
           <span class="src-icon">${icon}</span>
+          <span class="status-badge status-pending" title="所属案例编号">案例 ${escHtml(m.case_code || "?")}</span>
           <span class="title">${titleHtml}</span>
           <span class="status-badge ${statusClass}">${m.fetch_status}</span>
         </div>
         ${segLabel}
         ${m.fetch_error ? `<div style="color:#b3282d;margin-top:4px;">⚠ ${escHtml(m.fetch_error)}</div>` : ""}
         ${m.text_preview ? `<div class="preview-text">${escHtml(m.text_preview)}...</div>` : ""}
-        <div class="actions"><button class="link-btn" onclick="openMaterialPreview(${m.id})">🔍 预览全文</button></div>
+        <div class="actions">
+          <button class="link-btn" onclick="openMaterialPreview(${m.id})">🔍 预览全文</button>
+          <button class="link-btn" style="color:#b3282d;" onclick="deleteMaterial(${m.id})">🗑 删除</button>
+        </div>
       </div>`;
   }).join("");
 }
 
 function toggleSelect(id, checked) {
   if (checked) selectedMaterialIds.add(id); else selectedMaterialIds.delete(id);
+  updateSelectedMaterialCount();
+}
+
+function updateSelectedMaterialCount() {
+  const el = document.getElementById("selectedMaterialCount");
+  if (el) el.textContent = selectedMaterialIds.size;
+}
+
+function selectAllMaterials() {
+  // 一键全选是"当前列表"（已经按案例筛选/搜索过的那批），跟筛选框搭配着用就是"按案例一键全选"
+  materialsCache.filter(m => m.fetch_status === "success").forEach(m => selectedMaterialIds.add(m.id));
+  renderMaterialList();
+}
+
+function clearMaterialSelection() {
+  materialsCache.forEach(m => selectedMaterialIds.delete(m.id));
+  renderMaterialList();
+}
+
+async function deleteMaterial(id) {
+  if (!confirm("确定删除这条素材吗？删除后不可恢复。")) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/materials/${id}`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "删除失败");
+    selectedMaterialIds.delete(id);
+    toast("已删除素材");
+    loadMaterials();
+  } catch (e) {
+    toast("删除出错: " + e.message);
+  }
 }
 
 function openMaterialPreview(id) {
@@ -684,6 +887,7 @@ function renderCaseList() {
       </div>
       <div class="actions">
         <button class="link-btn" onclick="openCaseDetail(${c.id})">🔍 查看详情</button>
+        <button class="link-btn" onclick="openCaseEdit(${c.id})">✏️ 编辑内容</button>
         <button class="link-btn" onclick="editInChat(${c.id})">🤖 去AI助手编辑</button>
       </div>
     </div>`).join("");
@@ -691,6 +895,20 @@ function renderCaseList() {
 
 function toggleCaseSelect(id, checked) {
   if (checked) selectedCaseIds.add(id); else selectedCaseIds.delete(id);
+}
+
+async function deleteSelectedCases() {
+  const ids = Array.from(selectedCaseIds);
+  if (ids.length === 0) { toast("请先勾选要删除的案例"); return; }
+  if (!confirm(`确定删除勾选的 ${ids.length} 个案例吗？删除后不可恢复。`)) return;
+
+  const results = await Promise.allSettled(
+    ids.map(id => fetch(`${API_BASE}/api/cases/${id}`, { method: "DELETE" }))
+  );
+  const failCount = results.filter(r => r.status === "rejected" || !r.value.ok).length;
+  selectedCaseIds.clear();
+  toast(failCount === 0 ? `已删除 ${ids.length} 个案例` : `删除完成，${ids.length - failCount} 个成功，${failCount} 个失败`);
+  loadCases();
 }
 
 function editInChat(id) {
@@ -704,17 +922,103 @@ async function openCaseDetail(id) {
   const c = casesCache.find(x => x.id === id);
   if (!c) return;
   document.getElementById("previewTitle").textContent = `案例${c.case_code}：${c.title || ""}`;
-  document.getElementById("previewBody").innerHTML = renderCaseDetailHTML(c) +
+  const editBtnHtml = `<div style="margin-bottom:10px;"><button onclick="openCaseEdit(${c.id})">✏️ 编辑内容</button></div>`;
+  document.getElementById("previewBody").innerHTML = editBtnHtml + renderCaseDetailHTML(c) +
     '<div class="section-title">📝 修改记录</div><div class="loading">加载中...</div>';
   document.getElementById("previewModal").classList.add("active");
+
+  loadCaseMaterialsForCitations(id); // 不等它，加载完悬浮预览自然就能用了，不阻塞详情本身的展示
 
   try {
     const res = await fetch(`${API_BASE}/api/cases/${id}/audit_log`);
     const logs = await res.json();
-    document.getElementById("previewBody").innerHTML = renderCaseDetailHTML(c) + renderAuditLogHTML(logs);
+    document.getElementById("previewBody").innerHTML = editBtnHtml + renderCaseDetailHTML(c) + renderAuditLogHTML(logs);
   } catch (e) {
     // 修改记录加载失败不影响案例详情本身的展示，静默即可
   }
+}
+
+/* ---- 案例正文里的句级引用标注：[素材N:定位短语] 渲染成可悬浮的角标，hover时预览素材原文位置 ---- */
+const caseMaterialsCache = {}; // case_id -> [{id,url,title,full_text}, ...]，数组下标+1对应正文里的"素材N"
+
+async function loadCaseMaterialsForCitations(caseId) {
+  if (caseMaterialsCache[caseId]) return caseMaterialsCache[caseId];
+  try {
+    const res = await fetch(`${API_BASE}/api/cases/${caseId}/materials`);
+    const data = await res.json();
+    caseMaterialsCache[caseId] = data.materials || [];
+  } catch (e) {
+    caseMaterialsCache[caseId] = [];
+  }
+  return caseMaterialsCache[caseId];
+}
+
+const CITATION_RE = /\[素材(\d+):([^\]]*)\]/g;
+
+function renderNarrativeWithCitations(caseId, text) {
+  let html = "";
+  let lastIndex = 0;
+  let m;
+  CITATION_RE.lastIndex = 0;
+  while ((m = CITATION_RE.exec(text)) !== null) {
+    html += escHtml(text.slice(lastIndex, m.index));
+    const idx = m[1];
+    const anchor = m[2];
+    html += `<sup class="cite" data-case-id="${caseId}" data-idx="${idx}" data-anchor="${escHtml(anchor)}" `
+      + `onmouseenter="showCiteTooltip(this)" onmouseleave="hideCiteTooltip()">[${escHtml(idx)}]</sup>`;
+    lastIndex = CITATION_RE.lastIndex;
+  }
+  html += escHtml(text.slice(lastIndex));
+  return html;
+}
+
+function showCiteTooltip(el) {
+  const caseId = Number(el.dataset.caseId);
+  const idx = Number(el.dataset.idx);
+  const anchor = el.dataset.anchor || "";
+  const tooltip = document.getElementById("citeTooltip");
+
+  const materials = caseMaterialsCache[caseId];
+  if (!materials) {
+    tooltip.innerHTML = `<div class="ct-hint">素材加载中，请稍后再悬浮试一下…</div>`;
+  } else {
+    const material = materials[idx - 1];
+    if (!material) {
+      tooltip.innerHTML = `<div class="ct-hint">没有找到"素材${idx}"，可能是案例正文标注有误</div>`;
+    } else {
+      const fullText = material.full_text || "";
+      const pos = anchor ? fullText.indexOf(anchor) : -1;
+      let snippetHtml;
+      if (pos >= 0) {
+        const start = Math.max(0, pos - 40);
+        const end = Math.min(fullText.length, pos + anchor.length + 40);
+        snippetHtml = (start > 0 ? "…" : "")
+          + escHtml(fullText.slice(start, pos))
+          + `<mark>${escHtml(anchor)}</mark>`
+          + escHtml(fullText.slice(pos + anchor.length, end))
+          + (end < fullText.length ? "…" : "");
+      } else {
+        snippetHtml = escHtml(fullText.slice(0, 120)) + (fullText.length > 120 ? "…" : "")
+          + `<div class="ct-hint">（没能在原文里精确定位到这句引用，以上是素材开头部分）</div>`;
+      }
+      tooltip.innerHTML = `
+        <div class="ct-title">素材${idx}：${escHtml(material.title || material.url || "未命名素材")}</div>
+        <div class="ct-snippet">${snippetHtml}</div>
+      `;
+    }
+  }
+
+  const rect = el.getBoundingClientRect();
+  tooltip.classList.add("active");
+  const tw = tooltip.offsetWidth || 300;
+  let left = rect.left;
+  if (left + tw > window.innerWidth - 12) left = window.innerWidth - tw - 12;
+  tooltip.style.left = `${Math.max(12, left)}px`;
+  tooltip.style.top = `${rect.bottom + 6}px`;
+}
+
+function hideCiteTooltip() {
+  document.getElementById("citeTooltip").classList.remove("active");
 }
 
 function renderAuditLogHTML(logs) {
@@ -743,7 +1047,7 @@ function renderCaseDetailHTML(c) {
   const reading = c.further_reading || [];
   return `
     <div class="section-title">① 完整案例</div>
-    <div class="narrative-box">${escHtml(c.full_narrative || "")}</div>
+    <div class="narrative-box">${renderNarrativeWithCitations(c.id, c.full_narrative || "")}</div>
 
     <div class="section-title">② 案例教学目标</div>
     <table>
@@ -756,6 +1060,7 @@ function renderCaseDetailHTML(c) {
     <table>
       <tr><th>对应维度</th><td>${escHtml(se["对应维度"] || "")}</td></tr>
       <tr><th>摘录表述</th><td>${escHtml(se["摘录表述"] || "")}</td></tr>
+      ${SIX_DIMENSIONS.map(dim => `<tr><th>${escHtml(dim)}</th><td>${escHtml((se["六维度体现"] || {})[dim] || "")}</td></tr>`).join("")}
     </table>
 
     <div class="section-title">④ 适用课程举例</div>
@@ -784,6 +1089,206 @@ function renderCaseDetailHTML(c) {
       ${reading.map(r => `<tr><td>${escHtml(r.type || "")}</td><td>${escHtml(r.title || "")}</td><td><a href="${escHtml(r.url || "")}" target="_blank">${escHtml(r.url || "")}</a></td></tr>`).join("")}
     </table>
   `;
+}
+
+/* ================= 案例库：直接编辑案例内容 ================= */
+let editingCaseId = null;
+let editCourseRows = [];
+let editReadingRows = [];
+
+function openCaseEdit(id) {
+  const c = casesCache.find(x => x.id === id);
+  if (!c) return;
+  editingCaseId = id;
+  editCourseRows = (c.applicable_courses || []).map(r => ({
+    name: r["课程名称"] || "", chapter: r["适用章节"] || "", suggestion: r["融入方式建议"] || "",
+  }));
+  editReadingRows = (c.further_reading || []).map(r => ({
+    type: r.type || "", title: r.title || "", url: r.url || "",
+  }));
+  document.getElementById("previewTitle").textContent = `编辑案例${c.case_code}`;
+  document.getElementById("previewBody").innerHTML = renderCaseEditHTML(c);
+  document.getElementById("previewModal").classList.add("active");
+}
+
+function renderCaseEditHTML(c) {
+  const to = c.teaching_objectives || {};
+  const se = c.sizheng_elements || {};
+  const td = c.teaching_design || {};
+  const ev = c.evaluation || {};
+  const statusOptions = ["草稿", "待审核", "已采纳", "已驳回"];
+  return `
+    <div class="inline-row">
+      <div><label>标题</label><input type="text" id="edit_title" value="${escHtml(c.title || "")}"></div>
+      <div style="flex:0;min-width:120px;"><label>审核状态</label>
+        <select id="edit_status">${statusOptions.map(s => `<option value="${s}" ${c.status === s ? "selected" : ""}>${s}</option>`).join("")}</select>
+      </div>
+    </div>
+
+    <div class="section-title">① 完整案例</div>
+    <textarea id="edit_full_narrative" rows="8">${escHtml(c.full_narrative || "")}</textarea>
+
+    <div class="section-title">② 案例教学目标</div>
+    <label>知识目标</label><input type="text" id="edit_to_knowledge" value="${escHtml(to["知识目标"] || "")}">
+    <label>能力目标</label><input type="text" id="edit_to_ability" value="${escHtml(to["能力目标"] || "")}">
+    <label>素养目标</label><input type="text" id="edit_to_literacy" value="${escHtml(to["素养目标"] || "")}">
+
+    <div class="section-title">③ 课程思政元素</div>
+    <label>对应维度</label><input type="text" id="edit_se_dimension" value="${escHtml(se["对应维度"] || "")}">
+    <label>摘录表述</label><textarea id="edit_se_excerpt" rows="2">${escHtml(se["摘录表述"] || "")}</textarea>
+    ${SIX_DIMENSIONS.map((dim, i) => `<label>六维度体现 - ${escHtml(dim)}</label><textarea id="edit_sixdim_${i}" rows="2">${escHtml((se["六维度体现"] || {})[dim] || "")}</textarea>`).join("")}
+
+    <div class="section-title">④ 适用课程举例</div>
+    <div id="editCoursesTable">${renderCourseRowsHTML()}</div>
+    <button type="button" class="link-btn" onclick="addCourseRow()">＋ 添加一行</button>
+
+    <div class="section-title">⑤ 教学设计</div>
+    <label>课前</label><textarea id="edit_td_pre" rows="2">${escHtml(td["课前"] || "")}</textarea>
+    <label>课中</label><textarea id="edit_td_during" rows="2">${escHtml(td["课中"] || "")}</textarea>
+    <label>课后</label><textarea id="edit_td_post" rows="2">${escHtml(td["课后"] || "")}</textarea>
+
+    <div class="section-title">⑥ 课程评价与成效</div>
+    <label>目标达成度</label><textarea id="edit_ev_goal" rows="2">${escHtml(ev["目标达成度"] || "")}</textarea>
+    <label>过程参与度</label><textarea id="edit_ev_participation" rows="2">${escHtml(ev["过程参与度"] || "")}</textarea>
+    <label>教学反思</label><textarea id="edit_ev_reflection" rows="2">${escHtml(ev["教学反思"] || "")}</textarea>
+
+    <div class="section-title">⑦ 延伸阅读</div>
+    <div id="editReadingTable">${renderReadingRowsHTML()}</div>
+    <button type="button" class="link-btn" onclick="addReadingRow()">＋ 添加一行</button>
+
+    <div style="margin-top:16px;display:flex;gap:10px;">
+      <button onclick="saveCaseEdit()">💾 保存修改</button>
+      <button class="secondary" onclick="openCaseDetail(editingCaseId)">取消</button>
+    </div>
+  `;
+}
+
+function renderCourseRowsHTML() {
+  if (editCourseRows.length === 0) {
+    return '<div class="empty-hint" style="padding:8px 0;">暂无，点击下方"添加一行"</div>';
+  }
+  return `<table>
+    <tr><th>课程名称</th><th>适用章节</th><th>融入方式建议</th><th></th></tr>
+    ${editCourseRows.map((r, i) => `
+      <tr>
+        <td><input type="text" id="course_name_${i}" value="${escHtml(r.name)}"></td>
+        <td><input type="text" id="course_chapter_${i}" value="${escHtml(r.chapter)}"></td>
+        <td><input type="text" id="course_suggestion_${i}" value="${escHtml(r.suggestion)}"></td>
+        <td><button type="button" class="link-btn" style="color:#b3282d;" onclick="removeCourseRow(${i})">删除</button></td>
+      </tr>`).join("")}
+  </table>`;
+}
+
+function syncCourseRowsFromDOM() {
+  editCourseRows = editCourseRows.map((_, i) => ({
+    name: document.getElementById(`course_name_${i}`)?.value || "",
+    chapter: document.getElementById(`course_chapter_${i}`)?.value || "",
+    suggestion: document.getElementById(`course_suggestion_${i}`)?.value || "",
+  }));
+}
+
+function addCourseRow() {
+  syncCourseRowsFromDOM();
+  editCourseRows.push({ name: "", chapter: "", suggestion: "" });
+  document.getElementById("editCoursesTable").innerHTML = renderCourseRowsHTML();
+}
+
+function removeCourseRow(idx) {
+  syncCourseRowsFromDOM();
+  editCourseRows.splice(idx, 1);
+  document.getElementById("editCoursesTable").innerHTML = renderCourseRowsHTML();
+}
+
+function renderReadingRowsHTML() {
+  if (editReadingRows.length === 0) {
+    return '<div class="empty-hint" style="padding:8px 0;">暂无，点击下方"添加一行"</div>';
+  }
+  return `<table>
+    <tr><th>类型</th><th>标题</th><th>链接</th><th></th></tr>
+    ${editReadingRows.map((r, i) => `
+      <tr>
+        <td><input type="text" id="reading_type_${i}" value="${escHtml(r.type)}"></td>
+        <td><input type="text" id="reading_title_${i}" value="${escHtml(r.title)}"></td>
+        <td><input type="text" id="reading_url_${i}" value="${escHtml(r.url)}"></td>
+        <td><button type="button" class="link-btn" style="color:#b3282d;" onclick="removeReadingRow(${i})">删除</button></td>
+      </tr>`).join("")}
+  </table>`;
+}
+
+function syncReadingRowsFromDOM() {
+  editReadingRows = editReadingRows.map((_, i) => ({
+    type: document.getElementById(`reading_type_${i}`)?.value || "",
+    title: document.getElementById(`reading_title_${i}`)?.value || "",
+    url: document.getElementById(`reading_url_${i}`)?.value || "",
+  }));
+}
+
+function addReadingRow() {
+  syncReadingRowsFromDOM();
+  editReadingRows.push({ type: "", title: "", url: "" });
+  document.getElementById("editReadingTable").innerHTML = renderReadingRowsHTML();
+}
+
+function removeReadingRow(idx) {
+  syncReadingRowsFromDOM();
+  editReadingRows.splice(idx, 1);
+  document.getElementById("editReadingTable").innerHTML = renderReadingRowsHTML();
+}
+
+async function saveCaseEdit() {
+  syncCourseRowsFromDOM();
+  syncReadingRowsFromDOM();
+
+  const payload = {
+    title: document.getElementById("edit_title").value.trim(),
+    status: document.getElementById("edit_status").value,
+    full_narrative: document.getElementById("edit_full_narrative").value,
+    teaching_objectives: {
+      "知识目标": document.getElementById("edit_to_knowledge").value,
+      "能力目标": document.getElementById("edit_to_ability").value,
+      "素养目标": document.getElementById("edit_to_literacy").value,
+    },
+    sizheng_elements: {
+      "对应维度": document.getElementById("edit_se_dimension").value,
+      "摘录表述": document.getElementById("edit_se_excerpt").value,
+      "六维度体现": Object.fromEntries(
+        SIX_DIMENSIONS.map((dim, i) => [dim, document.getElementById(`edit_sixdim_${i}`).value])
+      ),
+    },
+    applicable_courses: editCourseRows
+      .filter(r => r.name || r.chapter || r.suggestion)
+      .map(r => ({ "课程名称": r.name, "适用章节": r.chapter, "融入方式建议": r.suggestion })),
+    teaching_design: {
+      "课前": document.getElementById("edit_td_pre").value,
+      "课中": document.getElementById("edit_td_during").value,
+      "课后": document.getElementById("edit_td_post").value,
+    },
+    evaluation: {
+      "目标达成度": document.getElementById("edit_ev_goal").value,
+      "过程参与度": document.getElementById("edit_ev_participation").value,
+      "教学反思": document.getElementById("edit_ev_reflection").value,
+    },
+    further_reading: editReadingRows
+      .filter(r => r.type || r.title || r.url)
+      .map(r => ({ type: r.type, title: r.title, url: r.url })),
+  };
+
+  try {
+    const res = await fetch(`${API_BASE}/api/cases/${editingCaseId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "保存失败");
+    toast("已保存修改");
+    const idx = casesCache.findIndex(x => x.id === editingCaseId);
+    if (idx >= 0) casesCache[idx] = data;
+    renderCaseList();
+    openCaseDetail(editingCaseId);
+  } catch (e) {
+    toast("保存出错: " + e.message);
+  }
 }
 
 async function exportSelectedCases() {

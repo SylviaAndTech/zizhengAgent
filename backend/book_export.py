@@ -9,7 +9,7 @@ import docx
 from docx.shared import Inches
 
 from db import Case, CaseKnowledgeMapping, DIMENSIONS
-from doc_writer import write_case_section
+from doc_writer import write_case_section, set_default_font
 from knowledge_graph import build_graph, render_graph_png
 
 # 对应 README 里"五维度固定值，对应大纲第二至六章"的映射关系
@@ -98,6 +98,7 @@ def _write_resource_index(doc, cases: list):
 
 def build_book_docx(db, status_filter: str = "已采纳") -> bytes:
     doc = docx.Document()
+    set_default_font(doc)
     doc.add_heading("讲好数字中国故事：人工智能类课程思政案例集（自动编译）", level=0)
 
     doc.add_heading("前言", level=1)

@@ -1,6 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 openai==2.53.0  # langchain-openai==1.4.1 需要 openai>=2.45.0，这里跟着一起提了版本
+httpx[socks]==0.27.2  # 兜底：即便代码里已经禁用了httpx读取本机代理，也避免环境里缺socksio时报错
 requests==2.32.3
 trafilatura==1.12.2
 sqlalchemy==2.0.35
@@ -10,7 +11,11 @@ python-multipart==0.0.9
 pydantic==2.9.2
 python-dotenv==1.0.1
 python-docx==1.1.2
-pypdf==5.0.1
+pymupdf==1.28.0  # 中文PDF解析明显比pypdf更稳（少乱码/少丢字），原来用的pypdf已替换掉
+# 扫描版PDF（没有文字层，整页是图片）走OCR兜底，需要系统装tesseract+中文语言包，pip装不了：
+#   macOS: brew install tesseract tesseract-lang
+#   Ubuntu/Debian: apt install tesseract-ocr tesseract-ocr-chi-sim
+# 没装tesseract时，普通PDF（有文字层）完全不受影响，只有真正遇到扫描件才会报错提示装tesseract
 networkx==3.3
 pyvis==0.3.2
 matplotlib==3.9.2

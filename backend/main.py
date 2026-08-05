@@ -1,7 +1,7 @@
 """
 FastAPI 主入口
 提供：素材导入、案例生成、案例查询/编辑/审核 等接口
-运行方式: uvicorn main:app --reload --port 8000
+运行方式: uvicorn main:app --reload --port 8082
 """
 import io
 import json
@@ -13,19 +13,20 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from db import (
-    init_db, get_db, RawMaterial, Case, CaseMaterial, DIMENSIONS,
+    init_db, get_db, SessionLocal, RawMaterial, Case, CaseMaterial, DIMENSIONS,
     KnowledgePoint, CaseKnowledgeMapping, ChatSession, CaseAuditLog,
 )
 from fetch_material import fetch_url_text
 from generate_case import generate_case_draft, enrich_case_with_knowledge
 from parse_document import parse_uploaded_document
 from knowledge_matching import extract_knowledge_points, match_case_to_knowledge, index_knowledge_point
-from chat_agent import run_chat
+from chat_agent import stream_chat
 from audit import log_case_change
-from doc_writer import write_case_section
+from doc_writer import write_case_section, set_default_font
 from knowledge_graph import build_graph, render_graph_png, render_graph_html
 from book_export import build_book_docx
 from material_index import index_material
@@ -95,16 +96,29 @@ class UpdateMappingRequest(BaseModel):
 
 @app.post("/api/materials/import")
 def import_materials(req: ImportMaterialsRequest, db: Session = Depends(get_db)):
-    """批量导入URL并抓取正文，落盘存档"""
+    """批量导入URL并抓取正文，落盘存档；同一案例下已经存过的URL不会重复入库"""
     results = []
     for url in req.urls:
         url = url.strip()
         if not url:
             continue
+
+        existing = (
+            db.query(RawMaterial)
+            .filter(RawMaterial.case_code == req.case_code, RawMaterial.url == url)
+            .first()
+        )
+        if existing:
+            d = _material_to_dict(existing)
+            d["duplicate"] = True
+            results.append(d)
+            continue
+
         fetched = fetch_url_text(url)
         material = RawMaterial(
             case_code=req.case_code,
             url=url,
+            source_title=fetched.get("title"),
             fetched_text=fetched["text"],
             fetch_status=fetched["status"],
             fetch_error=fetched["error"],
@@ -178,6 +192,7 @@ def upload_material(
 def _material_to_dict(m: RawMaterial) -> dict:
     return {
         "id": m.id,
+        "case_code": m.case_code,
         "url": m.url,
         "source_title": m.source_title,
         "source_type": m.source_type,
@@ -191,10 +206,68 @@ def _material_to_dict(m: RawMaterial) -> dict:
 
 
 @app.get("/api/materials")
-def list_materials(case_code: str, db: Session = Depends(get_db)):
-    """按案例编号查询已导入的素材"""
-    materials = db.query(RawMaterial).filter(RawMaterial.case_code == case_code).all()
+def list_materials(
+    case_code: str | None = None, q: str | None = None, db: Session = Depends(get_db)
+):
+    """查询素材库：case_code不填时返回全部案例的素材，填了就按案例编号过滤；
+    q是关键词搜索，匹配标题/URL/来源文件名/正文内容"""
+    query = db.query(RawMaterial)
+    if case_code:
+        query = query.filter(RawMaterial.case_code == case_code)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            or_(
+                RawMaterial.source_title.like(like),
+                RawMaterial.url.like(like),
+                RawMaterial.source_filename.like(like),
+                RawMaterial.fetched_text.like(like),
+            )
+        )
+    materials = query.order_by(RawMaterial.id.desc()).all()
     return [_material_to_dict(m) for m in materials]
+
+
+def _compute_next_case_code(case_codes: list[str]) -> str | None:
+    """给"新增素材默认归到哪个案例编号"提供一个合理的默认值：取现有案例编号里最大的一个，
+    把它最后一段数字加1（如 "3.4" -> "3.5"，"5" -> "6"）。没有任何现有编号、或编号格式不是
+    纯数字点分（如"3.4"）就返回None，交给用户自己填，不瞎猜一个可能没意义的默认值"""
+
+    def sort_key(code: str):
+        try:
+            return tuple(int(p) for p in code.split("."))
+        except ValueError:
+            return None
+
+    numeric = [(sort_key(c), c) for c in case_codes]
+    numeric = [(k, c) for k, c in numeric if k is not None]
+    if not numeric:
+        return None
+    numeric.sort(key=lambda x: x[0])
+    max_code = numeric[-1][1]
+    parts = max_code.split(".")
+    parts[-1] = str(int(parts[-1]) + 1)
+    return ".".join(parts)
+
+
+@app.get("/api/materials/case_codes")
+def list_material_case_codes(db: Session = Depends(get_db)):
+    """素材库里已经出现过的案例编号（供前端做筛选下拉），外加一个建议的"下一个案例编号"默认值"""
+    rows = db.query(RawMaterial.case_code).distinct().all()
+    codes = sorted({r[0] for r in rows if r[0]})
+    return {"case_codes": codes, "next_case_code": _compute_next_case_code(codes)}
+
+
+@app.delete("/api/materials/{material_id}")
+def delete_material(material_id: int, db: Session = Depends(get_db)):
+    """删除一条素材；同时清掉它在案例证据链里的关联记录"""
+    material = db.query(RawMaterial).filter(RawMaterial.id == material_id).first()
+    if not material:
+        raise HTTPException(404, "素材不存在")
+    db.query(CaseMaterial).filter(CaseMaterial.material_id == material_id).delete()
+    db.delete(material)
+    db.commit()
+    return {"deleted": True}
 
 
 # ---------- 案例生成/审核相关接口 ----------
@@ -274,6 +347,34 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
     return case.to_dict()
 
 
+@app.get("/api/cases/{case_id}/materials")
+def get_case_materials(case_id: int, db: Session = Depends(get_db)):
+    """案例正文里的[素材N:定位短语]引用标注，N是生成时素材的排列序号；这里按当初关联的顺序
+    （CaseMaterial.id升序，即生成时插入的先后顺序）把素材原文一并返回，前端才能在hover时
+    用"素材N"精确对上是哪一条、再用定位短语去全文里找具体位置"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "案例不存在")
+    links = (
+        db.query(CaseMaterial)
+        .filter(CaseMaterial.case_id == case_id)
+        .order_by(CaseMaterial.id)
+        .all()
+    )
+    materials = []
+    for link in links:
+        m = link.material
+        if not m:
+            continue
+        materials.append({
+            "id": m.id,
+            "url": m.url,
+            "title": m.source_title,
+            "full_text": m.fetched_text,
+        })
+    return {"materials": materials}
+
+
 @app.put("/api/cases/{case_id}")
 def update_case(case_id: int, req: UpdateCaseRequest, db: Session = Depends(get_db)):
     """人工编辑/审核通过案例"""
@@ -295,6 +396,20 @@ def update_case(case_id: int, req: UpdateCaseRequest, db: Session = Depends(get_
     if changes:
         log_case_change(db, case.id, "用户", changes)
     return case.to_dict()
+
+
+@app.delete("/api/cases/{case_id}")
+def delete_case(case_id: int, db: Session = Depends(get_db)):
+    """删除一个案例；连带清掉它的证据链关联、知识点关联建议、修改记录，避免留下悬空外键"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "案例不存在")
+    db.query(CaseMaterial).filter(CaseMaterial.case_id == case_id).delete()
+    db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.case_id == case_id).delete()
+    db.query(CaseAuditLog).filter(CaseAuditLog.case_id == case_id).delete()
+    db.delete(case)
+    db.commit()
+    return {"deleted": True}
 
 
 @app.get("/api/cases/{case_id}/audit_log")
@@ -322,6 +437,7 @@ def export_cases(req: ExportCasesRequest, db: Session = Depends(get_db)):
         raise HTTPException(400, "没有找到要导出的案例")
 
     doc = docx.Document()
+    set_default_font(doc)
     doc.add_heading("思政案例集（导出）", level=0)
 
     for c in cases:
@@ -383,28 +499,44 @@ def delete_chat_session(session_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/chat")
 def chat(req: ChatSendRequest, db: Session = Depends(get_db)):
-    """给指定会话追加一条用户消息，跑一轮agent对话，把结果落回这个会话"""
+    """给指定会话追加一条用户消息，以SSE流式推送AI助手逐token生成的回复；
+    流结束时（事件类型done）把完整历史落回这个会话，同一条SSE事件里带上刷新后的session，
+    前端不用再单独发一次请求同步会话标题/消息数"""
     session = db.query(ChatSession).filter(ChatSession.id == req.session_id).first()
     if not session:
         raise HTTPException(404, "会话不存在，请先创建一个新对话")
 
     history = json.loads(session.messages) if session.messages else []
     context_note = f"[当前案例编号：{req.case_code or '未指定'}，思政维度：{req.dimension or '未指定'}]\n"
+    session_id = req.session_id
+    user_message = req.message
 
-    try:
-        result = run_chat(history, context_note + req.message)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"AI助手出错: {str(e)}")
+    def event_stream():
+        # StreamingResponse的生成器是在这个路由函数return之后才被逐步消费的，
+        # 那时FastAPI已经把Depends(get_db)这个请求作用域的db session关掉了（ORM对象也随之脱管），
+        # 所以落库这一步不能复用上面注入的db，要单独开一个新session
+        try:
+            for event in stream_chat(history, context_note + user_message):
+                if event["type"] == "done":
+                    write_db = SessionLocal()
+                    try:
+                        s = write_db.query(ChatSession).filter(ChatSession.id == session_id).first()
+                        if s:
+                            s.messages = json.dumps(event["messages"], ensure_ascii=False)
+                            if s.title == "新对话" and user_message.strip():
+                                s.title = user_message.strip()[:20]
+                            write_db.commit()
+                            write_db.refresh(s)
+                            event = {**event, "session": s.to_dict()}
+                    finally:
+                        write_db.close()
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except ValueError as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'AI助手出错: {e}'}, ensure_ascii=False)}\n\n"
 
-    session.messages = json.dumps(result["messages"], ensure_ascii=False)
-    if session.title == "新对话" and req.message.strip():
-        session.title = req.message.strip()[:20]
-    db.commit()
-    db.refresh(session)
-
-    return {"session": session.to_dict(), "reply": result["reply"]}
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ---------- 知识点抽取与案例-知识点匹配 ----------

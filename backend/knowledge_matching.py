@@ -6,6 +6,7 @@ import json
 import os
 import re
 
+import fitz  # PyMuPDF
 import openai
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex
@@ -13,9 +14,11 @@ from llama_index.core.schema import TextNode
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from llama_index_setup import configure_llama_index
+from ocr_utils import doc_is_scanned, ocr_page_lines
 from parse_document import extract_text_from_docx, extract_text_from_pdf
 from prompts import KNOWLEDGE_MATCH_SYSTEM_PROMPT, build_knowledge_match_prompt
 from qwen_client import get_client, require_api_key, CHAT_MODEL
+from syllabus_table_ocr import extract_units_and_points
 
 load_dotenv()
 
@@ -54,29 +57,16 @@ def guess_course_name(filename: str, lines: list[tuple[str, bool]]) -> str:
     return base or filename
 
 
-def extract_knowledge_points(
-    filename: str, file_bytes: bytes, course_name_override: str | None = None
-) -> tuple[str, list[dict]]:
-    """
-    把大纲文档按标题分节，非标题的正文行作为候选知识点条目。
-    course_name_override 非空时直接采用（适合同一门课程分多个文件上传）；
-    为空则自动从文档标题/文件名猜课程名（适合一次批量上传多门课程的大纲）。
-    返回 (最终使用的课程名, 知识点列表)
-    """
-    lower_name = filename.lower()
-    if lower_name.endswith(".docx"):
-        lines = extract_text_from_docx(file_bytes)
-    elif lower_name.endswith(".pdf"):
-        lines = extract_text_from_pdf(file_bytes)
-    else:
-        raise ValueError("仅支持 .docx 或 .pdf 文件")
-
-    course_name = (
+def _resolve_course_name(course_name_override, filename, lines) -> str:
+    return (
         course_name_override.strip()
         if course_name_override and course_name_override.strip()
         else guess_course_name(filename, lines)
     )
 
+
+def _points_from_heading_lines(course_name: str, lines: list[tuple[str, bool]]) -> list[dict]:
+    """按标题分节：标题行更新当前章节，非标题行落在长度区间内的作为候选知识点"""
     points = []
     current_chapter = None
     for text, is_heading in lines:
@@ -89,7 +79,76 @@ def extract_knowledge_points(
                 "chapter": current_chapter,
                 "description": text,
             })
-    return course_name, points
+    return points
+
+
+def extract_knowledge_points(
+    filename: str, file_bytes: bytes, course_name_override: str | None = None
+) -> tuple[str, list[dict]]:
+    """
+    course_name_override 非空时直接采用（适合同一门课程分多个文件上传）；
+    为空则自动从文档标题/文件名猜课程名（适合一次批量上传多门课程的大纲）。
+    返回 (最终使用的课程名, 知识点列表)
+
+    PDF分两条路径：
+    - 正常数字PDF（有文字层）：按标题分节的启发式（跟docx共用同一套逻辑）。
+    - 扫描版PDF（没有文字层，比如打印后扫描/拍照转的PDF）：这类没法按"标题样式"分节，
+      改用 syllabus_table_ocr 对"知识单元/教学内容(知识点)"表格做OCR+按列重建，
+      直接拿到 (章节, 知识点) 列表，不走标题分节那一套。
+    """
+    lower_name = filename.lower()
+    if lower_name.endswith(".docx"):
+        lines = extract_text_from_docx(file_bytes)
+        course_name = _resolve_course_name(course_name_override, filename, lines)
+        return course_name, _points_from_heading_lines(course_name, lines)
+
+    if not lower_name.endswith(".pdf"):
+        raise ValueError("仅支持 .docx 或 .pdf 文件")
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        if doc.needs_pass and not doc.authenticate(""):
+            raise ValueError("PDF已加密，无法在没有密码的情况下解析")
+
+        if doc_is_scanned(doc):
+            course_name = (
+                course_name_override.strip()
+                if course_name_override and course_name_override.strip()
+                else _guess_course_name_from_scanned_title(_ocr_first_page_lines(doc), filename)
+            )
+            try:
+                units_points = extract_units_and_points(doc)
+            except Exception as e:
+                raise ValueError(f"这是一份扫描版PDF（没有文字层），OCR识别失败: {e}") from e
+            points = [
+                {"course_name": course_name, "chapter": chapter, "description": description}
+                for chapter, description in units_points
+                if MIN_KP_CHARS <= len(description) <= MAX_KP_CHARS
+            ]
+            return course_name, points
+    finally:
+        doc.close()
+
+    lines = extract_text_from_pdf(file_bytes)
+    course_name = _resolve_course_name(course_name_override, filename, lines)
+    return course_name, _points_from_heading_lines(course_name, lines)
+
+
+def _ocr_first_page_lines(doc) -> list[str]:
+    """扫描版PDF猜课程名用：只OCR第一页（标题一般在第一页），不用把全篇都跑一遍OCR"""
+    if len(doc) == 0:
+        return []
+    return [text for *_, text in ocr_page_lines(doc[0])]
+
+
+def _guess_course_name_from_scanned_title(lines: list[str], filename: str) -> str:
+    """OCR识别扫描件标题时，"《课程名》"经常被从中间断成好几行（比如"《工业互联网"和
+    "后端技术》"分成两行），先把开头几行拼起来再找书名号，比逐行找更容易命中"""
+    blob = "".join(lines[:10])
+    book_match = _BOOK_TITLE_RE.search(blob)
+    if book_match:
+        return book_match.group(1).strip()
+    return guess_course_name(filename, [(t, False) for t in lines])
 
 
 _index = None
