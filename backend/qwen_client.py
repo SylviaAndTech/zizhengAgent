@@ -72,19 +72,32 @@ def get_langchain_llm():
 
 
 def get_llama_index_llm():
-    """LlamaIndex用的Qwen聊天模型（原生DashScope SDK）。
-    我们目前的检索链路只用LlamaIndex做向量存取，不靠它做生成，
-    这里主要是为了把Settings.llm钉死在Qwen上，避免LlamaIndex内部逻辑悄悄尝试调用真正的OpenAI。"""
-    from llama_index.llms.dashscope import DashScope
-    return DashScope(model_name=CHAT_MODEL, api_key=os.environ.get("DASHSCOPE_API_KEY"))
+    """LlamaIndex用的聊天模型。我们目前的检索链路只用LlamaIndex做向量存取，不靠它做生成，
+    这里主要是为了把Settings.llm钉死住，避免LlamaIndex内部逻辑悄悄尝试调用真正的OpenAI。
+
+    注意：不能用 llama_index.llms.dashscope.DashScope —— 那个类是阿里云DashScope原生SDK，
+    请求硬编码打到 dashscope.aliyuncs.com，跟我们其他地方统一走的 DASHSCOPE_BASE_URL
+    （硅基流动的OpenAI兼容endpoint）完全是两个不同的平台；我们的API key是硅基流动的key，
+    打到阿里云自己的endpoint上必然认证失败。要用通用的OpenAI兼容客户端，把base_url显式指过去。"""
+    from llama_index.llms.openai_like import OpenAILike
+    return OpenAILike(
+        model=CHAT_MODEL,
+        api_base=DASHSCOPE_BASE_URL,
+        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+        is_chat_model=True,
+    )
 
 
-def get_llama_index_embed_model(text_type: str = "document"):
-    """LlamaIndex用的Qwen向量模型。text_type='document'用于建索引；
-    检索时LlamaIndex内部会自动用text_type='query'，不需要单独再配一个query用的实例"""
-    from llama_index.embeddings.dashscope import DashScopeEmbedding
-    return DashScopeEmbedding(
+def get_llama_index_embed_model():
+    """LlamaIndex用的向量模型。同样不能用 llama_index.embeddings.dashscope.DashScopeEmbedding
+    ——原因和上面get_llama_index_llm一样，那个类打的是阿里云自己的endpoint，不是硅基流动，
+    拿硅基流动的key去请求必然401。这里用OpenAIEmbedding+显式api_base，跟get_client()/
+    get_langchain_llm()保持同一套"OpenAI兼容协议+自定义base_url"的写法。
+    （旧版DashScopeEmbedding有个text_type参数区分document/query两种向量，OpenAI兼容协议的
+    embeddings接口没有这个概念，统一用同一个模型即可，调用方不用再传这个参数了。）"""
+    from llama_index.embeddings.openai import OpenAIEmbedding
+    return OpenAIEmbedding(
         model_name=EMBEDDING_MODEL,
-        text_type=text_type,
+        api_base=DASHSCOPE_BASE_URL,
         api_key=os.environ.get("DASHSCOPE_API_KEY"),
     )

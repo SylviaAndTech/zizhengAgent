@@ -55,16 +55,19 @@ def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
         )
 
 
-def generate_case_draft(case_code: str, dimension: str, materials: list[dict]) -> dict:
+def generate_case_draft(case_code: str, materials: list[dict]) -> dict:
     """
     materials: [{"id": int, "url": str, "title": str, "text": str}, ...]
-    返回解析后的案例草稿 dict（结构见 prompts.py 中的JSON schema）
+    返回解析后的案例草稿 dict（结构见 prompts.py 中的JSON schema）。
+    所属思政维度不是入参——每个案例现在都要求对五个官方思政维度逐一给出摘录表述+解释
+    （sizheng_elements.五维度阐释），"对应维度"（书稿五个章节分类里的哪一个）改由模型结合
+    案例内容自主判断给出。
     """
     if not materials:
         raise ValueError("没有可用的素材，无法生成案例（避免模型凭空编造）")
 
     require_api_key()
-    user_prompt = build_user_prompt(case_code, dimension, materials)
+    user_prompt = build_user_prompt(case_code, materials)
     return _chat_json(CASE_GENERATION_SYSTEM_PROMPT, user_prompt, max_tokens=4000)
 
 

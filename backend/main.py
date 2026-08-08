@@ -7,6 +7,8 @@ import io
 import json
 import logging
 import os
+import shutil
+import tempfile
 
 import docx
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
@@ -23,7 +25,10 @@ from db import (
 from fetch_material import fetch_url_text
 from generate_case import generate_case_draft, enrich_case_with_knowledge
 from parse_document import parse_uploaded_document
-from knowledge_matching import extract_knowledge_points, match_case_to_knowledge, index_knowledge_point
+from knowledge_matching import (
+    extract_knowledge_points, match_case_to_knowledge, index_knowledge_point,
+    reindex_knowledge_point, remove_knowledge_point_from_index,
+)
 from chat_agent import stream_chat
 from audit import log_case_change
 from doc_writer import write_case_section, set_default_font
@@ -60,7 +65,6 @@ class ImportMaterialsRequest(BaseModel):
 
 class GenerateCaseRequest(BaseModel):
     case_code: str
-    dimension: str
     material_ids: list[int]
 
 
@@ -83,13 +87,23 @@ class ExportCasesRequest(BaseModel):
 class ChatSendRequest(BaseModel):
     session_id: int
     message: str
-    case_code: str | None = None
-    dimension: str | None = None
 
 
 class UpdateMappingRequest(BaseModel):
     status: str | None = None
     suggestion_text: str | None = None
+
+
+class UpdateKnowledgePointRequest(BaseModel):
+    course_name: str | None = None
+    chapter: str | None = None
+    description: str | None = None
+
+
+class CreateKnowledgePointRequest(BaseModel):
+    course_name: str
+    chapter: str | None = None
+    description: str
 
 
 # ---------- 素材相关接口 ----------
@@ -141,10 +155,19 @@ def _index_material_best_effort(material: RawMaterial):
         logger.warning(f"素材(id={material.id})索引失败，AI助手暂时搜不到它: {e}")
 
 
+def _save_upload_to_tempfile(file: UploadFile, filename: str) -> str:
+    """把上传文件流式落盘到临时文件，返回路径。调用方处理完后负责用 os.unlink 清理。
+    大纲/素材文档可能到几百MB，用 file.file.read() 整个读进内存在小内存服务器上容易顶不住，
+    这里改成分块拷贝到磁盘，全程不在Python里持有完整文件的bytes对象"""
+    suffix = os.path.splitext(filename)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        return tmp.name
+
+
 @app.post("/api/materials/upload")
 def upload_material(
     case_code: str = Form(...),
-    dimension: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -154,13 +177,15 @@ def upload_material(
     if not (lower_name.endswith(".docx") or lower_name.endswith(".pdf")):
         raise HTTPException(400, "仅支持 .docx 或 .pdf 文件（不支持旧版 .doc）")
 
-    file_bytes = file.file.read()
     source_type = "docx" if lower_name.endswith(".docx") else "pdf"
 
+    tmp_path = _save_upload_to_tempfile(file, filename)
     try:
-        segments = parse_uploaded_document(filename, file_bytes)
+        segments = parse_uploaded_document(filename, tmp_path)
     except Exception as e:
         raise HTTPException(400, f"文档解析失败: {str(e)}")
+    finally:
+        os.unlink(tmp_path)
 
     if not segments:
         raise HTTPException(400, "没有从文档中提取到任何正文内容")
@@ -300,7 +325,7 @@ def generate_case(req: GenerateCaseRequest, db: Session = Depends(get_db)):
     ]
 
     try:
-        draft = generate_case_draft(req.case_code, req.dimension, material_payload)
+        draft = generate_case_draft(req.case_code, material_payload)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -308,7 +333,7 @@ def generate_case(req: GenerateCaseRequest, db: Session = Depends(get_db)):
 
     case = Case(
         case_code=req.case_code,
-        dimension=req.dimension,
+        dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
         title=draft.get("title"),
         full_narrative=draft.get("full_narrative"),
         teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
@@ -507,7 +532,6 @@ def chat(req: ChatSendRequest, db: Session = Depends(get_db)):
         raise HTTPException(404, "会话不存在，请先创建一个新对话")
 
     history = json.loads(session.messages) if session.messages else []
-    context_note = f"[当前案例编号：{req.case_code or '未指定'}，思政维度：{req.dimension or '未指定'}]\n"
     session_id = req.session_id
     user_message = req.message
 
@@ -516,7 +540,7 @@ def chat(req: ChatSendRequest, db: Session = Depends(get_db)):
         # 那时FastAPI已经把Depends(get_db)这个请求作用域的db session关掉了（ORM对象也随之脱管），
         # 所以落库这一步不能复用上面注入的db，要单独开一个新session
         try:
-            for event in stream_chat(history, context_note + user_message):
+            for event in stream_chat(history, user_message):
                 if event["type"] == "done":
                     write_db = SessionLocal()
                     try:
@@ -555,6 +579,7 @@ def upload_knowledge(
     """
     created = []
     errors = []
+    skipped_duplicate_points = 0
 
     for file in files:
         filename = file.filename or "(未命名文件)"
@@ -562,18 +587,39 @@ def upload_knowledge(
             errors.append(f"{filename}：仅支持 .docx 或 .pdf 文件")
             continue
 
-        file_bytes = file.file.read()
+        if db.query(KnowledgePoint).filter(KnowledgePoint.source_filename == filename).first():
+            errors.append(f"{filename}：这个文件名已经上传过了，跳过（如果是新版本，请先删掉旧的知识点再传）")
+            continue
+
+        tmp_path = _save_upload_to_tempfile(file, filename)
         try:
-            detected_course_name, points = extract_knowledge_points(filename, file_bytes, course_name)
+            detected_course_name, points = extract_knowledge_points(filename, tmp_path, course_name)
         except Exception as e:
             errors.append(f"{filename}：解析失败 {str(e)}")
             continue
+        finally:
+            os.unlink(tmp_path)
 
         if not points:
             errors.append(f"{filename}：没有提取到可用的知识点条目")
             continue
 
         for p in points:
+            # 同一门课程、同一章节下，知识点描述完全一样就不重复入库
+            # （同一份大纲重复解析、或者不同文件里覆盖了相同内容时很容易出现）
+            exists = (
+                db.query(KnowledgePoint)
+                .filter(
+                    KnowledgePoint.course_name == p["course_name"],
+                    KnowledgePoint.chapter == p["chapter"],
+                    KnowledgePoint.description == p["description"],
+                )
+                .first()
+            )
+            if exists:
+                skipped_duplicate_points += 1
+                continue
+
             kp = KnowledgePoint(
                 course_name=p["course_name"],
                 chapter=p["chapter"],
@@ -596,7 +642,10 @@ def upload_knowledge(
     if not created and errors:
         raise HTTPException(400, "；".join(errors))
 
-    return {"imported": created, "count": len(created), "errors": errors}
+    return {
+        "imported": created, "count": len(created), "errors": errors,
+        "skipped_duplicate_points": skipped_duplicate_points,
+    }
 
 
 @app.get("/api/knowledge")
@@ -612,6 +661,92 @@ def list_knowledge(course_name: str | None = None, db: Session = Depends(get_db)
         }
         for k in points
     ]
+
+
+@app.post("/api/knowledge")
+def create_knowledge_point(req: CreateKnowledgePointRequest, db: Session = Depends(get_db)):
+    """手动添加一条知识点，跟批量上传大纲解析出来的条目走同一张表，只是来源不是文件解析"""
+    course_name = req.course_name.strip()
+    description = req.description.strip()
+    if not course_name or not description:
+        raise HTTPException(400, "课程名称和知识点描述不能为空")
+
+    kp = KnowledgePoint(
+        course_name=course_name,
+        chapter=(req.chapter or "").strip() or None,
+        description=description,
+        source_filename=None,
+    )
+    db.add(kp)
+    db.commit()
+    db.refresh(kp)
+    try:
+        index_knowledge_point(kp)
+    except Exception as e:
+        logger.warning(f"知识点(id={kp.id})索引失败，匹配时暂时召回不到它: {e}")
+    return {
+        "id": kp.id, "course_name": kp.course_name,
+        "chapter": kp.chapter, "description": kp.description,
+        "source_filename": kp.source_filename,
+    }
+
+
+@app.delete("/api/knowledge")
+def delete_knowledge_by_course(course_name: str, db: Session = Depends(get_db)):
+    """删掉一门课程下的全部知识点（连带向量索引），用于整门课程的大纲要重新导入或者传错课程了的场景"""
+    points = db.query(KnowledgePoint).filter(KnowledgePoint.course_name == course_name).all()
+    if not points:
+        raise HTTPException(404, "没有找到这门课程的知识点")
+    point_ids = [k.id for k in points]
+    db.query(KnowledgePoint).filter(KnowledgePoint.id.in_(point_ids)).delete(synchronize_session=False)
+    db.commit()
+    for point_id in point_ids:
+        try:
+            remove_knowledge_point_from_index(point_id)
+        except Exception as e:
+            logger.warning(f"知识点(id={point_id})从向量库删除失败，语义检索可能还会召回它: {e}")
+    return {"deleted": True, "count": len(point_ids)}
+
+
+@app.put("/api/knowledge/{point_id}")
+def update_knowledge_point(point_id: int, req: UpdateKnowledgePointRequest, db: Session = Depends(get_db)):
+    """人工修正一条知识点（抽取难免有错，特别是扫描件OCR来的）；描述改了要重新建索引，
+    不然向量检索命中的还是修改前的旧文本"""
+    kp = db.query(KnowledgePoint).filter(KnowledgePoint.id == point_id).first()
+    if not kp:
+        raise HTTPException(404, "知识点不存在")
+
+    update_data = req.model_dump(exclude_unset=True)
+    description_changed = "description" in update_data and update_data["description"] != kp.description
+    for field, value in update_data.items():
+        setattr(kp, field, value)
+    db.commit()
+    db.refresh(kp)
+
+    if description_changed:
+        try:
+            reindex_knowledge_point(kp)
+        except Exception as e:
+            logger.warning(f"知识点(id={kp.id})重新索引失败，语义检索暂时还是旧文本: {e}")
+
+    return {
+        "id": kp.id, "course_name": kp.course_name, "chapter": kp.chapter,
+        "description": kp.description, "source_filename": kp.source_filename,
+    }
+
+
+@app.delete("/api/knowledge/{point_id}")
+def delete_knowledge_point(point_id: int, db: Session = Depends(get_db)):
+    kp = db.query(KnowledgePoint).filter(KnowledgePoint.id == point_id).first()
+    if not kp:
+        raise HTTPException(404, "知识点不存在")
+    db.delete(kp)
+    db.commit()
+    try:
+        remove_knowledge_point_from_index(point_id)
+    except Exception as e:
+        logger.warning(f"知识点(id={point_id})从向量库删除失败，语义检索可能还会召回它: {e}")
+    return {"deleted": True}
 
 
 @app.post("/api/cases/{case_id}/match_knowledge")

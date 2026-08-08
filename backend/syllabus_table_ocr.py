@@ -1,18 +1,24 @@
 """
-扫描版课程大纲PDF里"知识单元/教学内容(知识点)/教学目标/..."这类表格的OCR专用解析。
+课程大纲数字PDF（有文字层，不是扫描件）里"知识单元/教学内容(知识点)/教学目标/..."这类
+表格的解析。按坐标分列，全程不调用大模型，免费、瞬间出结果。
 
-这类表格没有文字层，只能OCR；而OCR吐出来的是按阅读顺序排列的文本行，天然会把同一行里
-"知识点"列和右边"教学目标"列的文字揉在一起（两列都用"1. 2. 3."编号，混在一起后没法区分
-哪条是知识点、哪条是教学目标）。这里用每行文字的横坐标做一次简化的"列还原"：
-先在表头行里找到"知识单元"列和"教学内容/知识点"列各自的横坐标，之后每一行正文按横坐标
-落在哪一列，就归到哪一列，从而只取"知识点"列的编号条目，不混入旁边教学目标列的内容。
+（扫描件走的是另一套方案，见 syllabus_vision_ocr.py：扫描件没有可靠的文字层坐标，
+按坐标分列常常认错——尤其是窄列里被拉伸变形的英文单词，Tesseract逐字符识别没有上下文
+纠错能力；扫描件改用视觉大模型直接"看图"识别，效果好得多，但要花钱调用，所以只在真正
+遇到扫描件时才用。）
+
+文字层里同一行会把"知识点"列和右边"教学目标"列的文字揉在一起（两列都用"1. 2. 3."编号，
+混在一起后没法区分哪条是知识点、哪条是教学目标）。这里用每行文字的横坐标做一次简化的
+"列还原"：先在表头行里找到"知识单元"列和"教学内容/知识点"列各自的横坐标，之后每一行
+正文按横坐标落在哪一列，就归到哪一列，从而只取"知识点"列的编号条目，不混入旁边教学目标
+列的内容。
 
 只处理这一种表格结构（知识单元+知识点两列相邻、知识点条目用"N."编号），不是通用表格解析器；
 但这是高校OBE培养方案教学大纲里最常见的标准格式，具备一定的通用性。
 """
 import re
 
-from ocr_utils import ocr_page_lines
+from ocr_utils import native_page_lines
 
 _NUM_ITEM_RE = re.compile(r"^\s*(\d{1,2})[.\、]\s*(\S.*)$")
 _TOP_SECTION_RE = re.compile(r"[六七八九十]、|课程考核方式")
@@ -47,9 +53,12 @@ def _find_column_anchors(lines):
     return best[1], best[2]  # unit_cx, point_cx
 
 
-def extract_units_and_points(doc) -> list[tuple[str | None, str]]:
+def extract_units_and_points(doc, get_page_lines=native_page_lines) -> list[tuple[str | None, str]]:
     """
-    doc: 已打开的 fitz.Document（扫描版PDF）
+    doc: 已打开的 fitz.Document（有文字层的数字PDF）
+    get_page_lines: 单页取"带坐标文本行"的方式，默认直接读文字层（ocr_utils.native_page_lines）。
+      理论上也能传ocr_page_lines给扫描件用，但扫描件现在走的是效果好得多的
+      syllabus_vision_ocr.py，不会再用到这里。
     返回 [(章节名或None, 知识点描述), ...]，按出现顺序
     """
     results: list[tuple[str | None, str]] = []
@@ -58,7 +67,7 @@ def extract_units_and_points(doc) -> list[tuple[str | None, str]]:
     last_known_chapter = None
 
     for pno in range(len(doc)):
-        lines = ocr_page_lines(doc[pno])
+        lines = get_page_lines(doc[pno])
 
         # 顶级章节分界（比如"六、课程考核方式"）之后就不是知识单元表格了，切掉
         cutoff_y = None

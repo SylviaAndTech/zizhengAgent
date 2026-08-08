@@ -47,3 +47,20 @@ def ocr_document_plain_text(doc) -> list[str]:
         for x0, y0, x1, y1, text in ocr_page_lines(page):
             all_lines.append(text)
     return all_lines
+
+
+def native_page_lines(page) -> list[tuple[float, float, float, float, str]]:
+    """跟ocr_page_lines返回同样的结构（每行文字+坐标），但直接读PDF自带的文字层，不用OCR。
+    "知识单元/教学内容(知识点)"这种表格排版不只出现在扫描件里，数字PDF（有文字层）一样可能用
+    这种表格，所以按坐标分列的解析逻辑（syllabus_table_ocr.py）需要能同时接两种"取行"的方式。"""
+    d = page.get_text("dict")
+    lines = []
+    for block in d["blocks"]:
+        for line in block.get("lines", []):
+            text = "".join(span["text"] for span in line["spans"]).strip()
+            if not text:
+                continue
+            x0, y0, x1, y1 = line["bbox"]
+            lines.append((x0, y0, x1, y1, text))
+    lines.sort(key=lambda l: (round(l[1] / 5), l[0]))
+    return lines

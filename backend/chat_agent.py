@@ -14,8 +14,11 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
-from db import SessionLocal, RawMaterial, Case, CaseMaterial, DIMENSIONS
-from generate_case import generate_case_draft as _generate_case_draft_impl
+from db import SessionLocal, RawMaterial, Case, CaseMaterial, CaseKnowledgeMapping, DIMENSIONS
+from generate_case import (
+    generate_case_draft as _generate_case_draft_impl,
+    enrich_case_with_knowledge as _enrich_case_with_knowledge_impl,
+)
 from material_index import search_materials as _search_materials_impl
 from qwen_client import get_langchain_llm, require_api_key, MAX_TOOL_ROUNDS
 from audit import log_case_change
@@ -29,7 +32,8 @@ SYSTEM_PROMPT = f"""你是"思政案例生成工作台"的AI助手，帮助用�
 3. 编辑已有案例前，先用 get_case 工具看当前完整内容，只改用户要求的部分，其余字段原样保留（update_case 只需要传你要修改的字段）。
 4. 修改内容后必须调用 update_case 把结果写回数据库，不要只在聊天里描述而不落库。
 5. 如果用户是在描述内容而不是给出具体案例编号/素材ID（比如"有没有关于XX的素材"），用 search_materials 做语义检索，别瞎猜material_id。
-6. 回复用简短的中文说明你做了什么、案例现在是什么状态，不要大段罗列JSON。
+6. 如果用户要求"用已采纳的知识点补充案例的适用课程举例/教学设计"，直接调用 enrich_case_with_accepted_knowledge 工具（不要自己瞎编内容），完成后可以继续跟用户对话调整细节。
+7. 回复用简短的中文说明你做了什么、案例现在是什么状态，不要大段罗列JSON。
 
 可用的思政维度：{", ".join(DIMENSIONS)}
 """
@@ -90,8 +94,11 @@ def get_case(case_id: int) -> str:
 
 
 @tool
-def generate_case_draft(case_code: str, dimension: str, material_ids: list[int]) -> str:
-    """用指定的素材ID列表，调用模型生成一份新的七段式案例草稿并存入数据库"""
+def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
+    """用指定的素材ID列表，调用模型生成一份新的七段式案例草稿并存入数据库。
+    不需要指定思政维度——每个案例都要求对五个官方思政维度（政治认同/家国情怀/文化素养/
+    宪法法治意识/道德修养）逐一给出摘录表述+解释，案例所属的书稿章节分类（也是这五个维度之一）
+    由模型结合案例内容自主判断给出。"""
     db = SessionLocal()
     try:
         materials = db.query(RawMaterial).filter(RawMaterial.id.in_(material_ids)).all()
@@ -103,13 +110,13 @@ def generate_case_draft(case_code: str, dimension: str, material_ids: list[int])
             for m in success_materials
         ]
         try:
-            draft = _generate_case_draft_impl(case_code, dimension, payload)
+            draft = _generate_case_draft_impl(case_code, payload)
         except ValueError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
         case = Case(
             case_code=case_code,
-            dimension=dimension,
+            dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
             title=draft.get("title"),
             full_narrative=draft.get("full_narrative"),
             teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
@@ -178,7 +185,66 @@ def update_case(
         db.close()
 
 
-TOOLS = [list_materials, search_materials, list_cases, get_case, generate_case_draft, update_case]
+@tool
+def enrich_case_with_accepted_knowledge(case_id: int) -> str:
+    """用某个案例在「知识点匹配」页面已经人工标记为"已采纳"的知识点关联，调用模型补充/更新
+    这个案例的"适用课程举例"与"教学设计"两个字段，并直接写回数据库。这个案例必须已经跑过
+    知识点匹配、且至少有一条被标记为"已采纳"，否则会返回error，如果报错就把这个情况告诉用户，
+    不要自己凭空编造适用课程举例/教学设计的内容。"""
+    db = SessionLocal()
+    try:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if not case:
+            return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
+
+        accepted = (
+            db.query(CaseKnowledgeMapping)
+            .filter(CaseKnowledgeMapping.case_id == case_id, CaseKnowledgeMapping.status == "已采纳")
+            .all()
+        )
+        if not accepted:
+            return json.dumps(
+                {"error": "这个案例还没有已采纳的知识点关联，请先在「知识点匹配」页面运行匹配并采纳至少一条"},
+                ensure_ascii=False,
+            )
+
+        accepted_payload = [
+            {
+                "course_name": m.knowledge_point.course_name,
+                "chapter": m.knowledge_point.chapter,
+                "description": m.knowledge_point.description,
+                "suggestion_text": m.suggestion_text,
+            }
+            for m in accepted
+        ]
+        try:
+            enrichment = _enrich_case_with_knowledge_impl(case.to_dict(), accepted_payload)
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+        changes = {}
+        for field in ("applicable_courses", "teaching_design"):
+            if field not in enrichment:
+                continue
+            old_value = getattr(case, field, None)
+            new_value = json.dumps(enrichment[field], ensure_ascii=False)
+            if old_value != new_value:
+                changes[field] = {"old": old_value, "new": new_value}
+            setattr(case, field, new_value)
+
+        db.commit()
+        db.refresh(case)
+        if changes:
+            log_case_change(db, case.id, "AI助手(知识点补充)", changes)
+        return json.dumps(case.to_dict(), ensure_ascii=False)
+    finally:
+        db.close()
+
+
+TOOLS = [
+    list_materials, search_materials, list_cases, get_case, generate_case_draft, update_case,
+    enrich_case_with_accepted_knowledge,
+]
 
 _agent = None
 

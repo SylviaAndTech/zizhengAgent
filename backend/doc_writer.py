@@ -48,10 +48,14 @@ def write_case_section(doc, case_dict: dict, heading_level: int = 1):
 
     doc.add_heading("三、课程思政元素", level=sub)
     for k, v in (d["sizheng_elements"] or {}).items():
-        if k == "六维度体现" and isinstance(v, dict):
-            doc.add_paragraph("六维度体现：")
-            for dim, text in v.items():
-                doc.add_paragraph(f"　　{dim}：{text}")
+        if k == "五维度阐释" and isinstance(v, dict):
+            doc.add_paragraph("五维度阐释：")
+            for dim, detail in v.items():
+                if isinstance(detail, dict):
+                    doc.add_paragraph(f"　　{dim} - 摘录表述：{detail.get('摘录表述', '')}")
+                    doc.add_paragraph(f"　　{dim} - 解释：{detail.get('解释', '')}")
+                else:
+                    doc.add_paragraph(f"　　{dim}：{detail}")
         else:
             doc.add_paragraph(f"{k}：{v}")
 

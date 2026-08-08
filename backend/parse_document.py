@@ -3,7 +3,6 @@
 拆分是启发式的（无需调用LLM），拆不出明显结构时整篇作为单个候选素材兜底，
 避免用户上传的文档因为格式特殊而被静默丢弃。
 """
-import io
 import re
 
 import docx
@@ -29,9 +28,11 @@ def _looks_like_heading(line: str) -> bool:
     return any(p.match(line) for p in HEADING_PATTERNS)
 
 
-def extract_text_from_docx(file_bytes: bytes) -> list[tuple[str, bool]]:
-    """返回 [(段落文本, 是否为Heading样式或形似标题), ...]"""
-    document = docx.Document(io.BytesIO(file_bytes))
+def extract_text_from_docx(file_path: str) -> list[tuple[str, bool]]:
+    """返回 [(段落文本, 是否为Heading样式或形似标题), ...]
+    file_path: 磁盘上的临时文件路径，而不是读进内存的bytes——大文件（几百MB）
+    整个读进内存再处理，在小内存的服务器上容易顶不住，改成直接从磁盘流式读取"""
+    document = docx.Document(file_path)
     lines = []
     for para in document.paragraphs:
         text = para.text.strip()
@@ -42,11 +43,11 @@ def extract_text_from_docx(file_bytes: bytes) -> list[tuple[str, bool]]:
     return lines
 
 
-def extract_text_from_pdf(file_bytes: bytes) -> list[tuple[str, bool]]:
+def extract_text_from_pdf(file_path: str) -> list[tuple[str, bool]]:
     """PDF没有样式信息，只能靠文本规则判断是否像标题。
     用PyMuPDF而不是pypdf：pypdf对国产办公软件导出的中文PDF（自定义CID字体编码）经常提取出
     乱码或大段丢字，PyMuPDF的字体/编码解析明显更稳，是目前公认解决中文PDF乱码问题的主流方案。"""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    doc = fitz.open(file_path)
     try:
         if doc.needs_pass and not doc.authenticate(""):
             raise ValueError("PDF已加密，无法在没有密码的情况下解析")
@@ -115,13 +116,14 @@ def split_into_cases(lines: list[tuple[str, bool]]) -> list[dict]:
     return segments
 
 
-def parse_uploaded_document(filename: str, file_bytes: bytes) -> list[dict]:
-    """入口函数：按扩展名选择解析器，返回拆分后的候选案例列表"""
+def parse_uploaded_document(filename: str, file_path: str) -> list[dict]:
+    """入口函数：按扩展名选择解析器，返回拆分后的候选案例列表。
+    file_path: 磁盘上的临时文件路径（调用方负责上传落盘和之后的清理）"""
     lower_name = filename.lower()
     if lower_name.endswith(".docx"):
-        lines = extract_text_from_docx(file_bytes)
+        lines = extract_text_from_docx(file_path)
     elif lower_name.endswith(".pdf"):
-        lines = extract_text_from_pdf(file_bytes)
+        lines = extract_text_from_pdf(file_path)
     else:
         raise ValueError("仅支持 .docx 或 .pdf 文件")
 

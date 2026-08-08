@@ -39,13 +39,6 @@
     flex-wrap: wrap;
     gap: 10px;
   }
-  .context-bar { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-  .context-bar input, .context-bar select {
-    padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
-    font-size: 13px; font-family: inherit;
-  }
-  .context-bar input[type=text] { width: 90px; }
-
   /* ---------- 标签导航 ---------- */
   .tab-nav { display: flex; gap: 4px; background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 0 24px; }
   .tab-btn {
@@ -123,6 +116,8 @@
     align-self: center; background: #f0ece7; color: #8a817a; font-size: 11px;
     padding: 3px 10px; border-radius: 10px;
   }
+  .case-link-chip { background: #e6f2e6; color: var(--success); display: flex; align-items: center; gap: 8px; }
+  .case-link-chip button { margin: 0; padding: 2px 10px; font-size: 11px; }
   .suggestion-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 4px 10px; }
   .suggestion-chip { background: #fff; border: 1px solid var(--border); color: var(--text); border-radius: 16px; padding: 6px 12px; font-size: 12px; cursor: pointer; margin: 0; }
   .suggestion-chip:hover { border-color: var(--primary); color: var(--primary); }
@@ -170,6 +165,11 @@
     padding: 10px 18px; border-radius: 6px; font-size: 13px; z-index: 999; opacity: 0.95;
   }
   .loading { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .suggestion-preview {
+    cursor: pointer; white-space: pre-wrap; line-height: 1.6; padding: 4px 6px; margin: -4px -6px;
+    border-radius: 4px; min-height: 1.6em;
+  }
+  .suggestion-preview:hover { background: #f2ece3; }
   .inline-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
   .inline-row > div { flex: 1; min-width: 160px; }
 
@@ -204,11 +204,6 @@
   <div>
     <h1>📘 思政案例生成工作台</h1>
     <div class="subtitle">素材导入 → AI助手对话生成/编辑 → 案例库审核导出 → 知识点匹配补充 | 原型 v0.3</div>
-  </div>
-  <div class="context-bar">
-    <span>AI助手默认上下文</span>
-    <input type="text" id="caseCode" placeholder="如 3.4（可留空）" title="案例编号，AI助手对话时的默认上下文；从素材库勾选素材生成案例草稿时会自动同步成素材实际所属的案例编号">
-    <select id="dimensionSelect"></select>
   </div>
 </div>
 
@@ -287,7 +282,7 @@
       </div>
     </div>
     <div id="materialList" style="margin-top:10px;"><div class="empty-hint">暂无素材，请先导入</div></div>
-    <button onclick="sendSelectedToAgent()">🤖 用勾选素材，去「AI助手」生成案例草稿</button>
+    <button style="margin-top:10px;" onclick="sendSelectedToAgent()">🤖 用勾选素材，去「AI助手」生成案例草稿</button>
   </div>
 </div>
 
@@ -336,8 +331,20 @@
         <label>按课程筛选</label>
         <select id="courseFilterSelect" onchange="renderKnowledgeList()"></select>
       </div>
+      <div style="flex:0;">
+        <label>&nbsp;</label>
+        <button class="secondary" style="margin:0;background:var(--danger);color:white;" onclick="deleteKnowledgeByCourse()">🗑 删除该课程全部知识点</button>
+      </div>
     </div>
     <div id="knowledgeList" style="margin-top:10px;"><div class="empty-hint">还没有导入任何知识点，先上传课程教学大纲</div></div>
+
+    <div class="section-title">➕ 手动添加一条知识点</div>
+    <div class="inline-row">
+      <div><label>课程</label><input type="text" id="newKpCourse" placeholder="课程名称"></div>
+      <div><label>章节</label><input type="text" id="newKpChapter" placeholder="章节（可留空）"></div>
+      <div style="flex:2;"><label>知识点描述</label><input type="text" id="newKpDescription" placeholder="知识点描述"></div>
+      <div style="flex:0;"><label>&nbsp;</label><button onclick="addKnowledgePointManually()">添加</button></div>
+    </div>
   </div>
 
   <div class="card">
@@ -355,11 +362,12 @@
         <select id="matchCaseSelect"></select>
       </div>
       <div style="flex:0;">
-        <button onclick="runMatch()">🔍 运行匹配</button>
+        <button id="runMatchBtn" onclick="runMatch()">🔍 运行匹配</button>
       </div>
     </div>
-    <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、编辑融入方式建议</div></div>
-    <button onclick="enrichCurrentCase()" style="background:var(--success)">✨ 用已采纳的知识点，补充该案例的「适用课程举例」与「教学设计」</button>
+    <div id="matchLoading" class="loading" style="display:none;">⏳ 正在匹配中，请稍候...</div>
+    <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div></div>
+    <button onclick="enrichCurrentCase()" style="background:var(--success)">✨ 用已采纳的知识点，补充该案例的「适用课程举例」与「教学设计」（在AI助手对话里进行）</button>
   </div>
 </div>
 
@@ -454,6 +462,30 @@ function addToolChip(container, text) {
   container.appendChild(div);
 }
 
+// 这两个工具调用成功后返回的是完整的案例对象（Case.to_dict()），可以直接给用户一个案例链接
+const CASE_LINK_TOOLS = new Set(["generate_case_draft", "update_case"]);
+
+function addCaseLinkChip(container, caseObj) {
+  const div = document.createElement("div");
+  div.className = "tool-chip case-link-chip";
+  div.innerHTML = `✅ 案例${escHtml(caseObj.case_code || "")}：${escHtml(caseObj.title || "(无标题)")}`
+    + `<button class="secondary" onclick="openCaseFromChat(${caseObj.id})">🔗 查看 / 编辑</button>`;
+  container.appendChild(div);
+}
+
+async function openCaseFromChat(id) {
+  if (!casesCache.find(c => c.id === id)) {
+    try {
+      const res = await fetch(`${API_BASE}/api/cases/${id}`);
+      if (res.ok) casesCache.unshift(await res.json());
+    } catch (e) {
+      // 拿不到就算了，下面openCaseDetail找不到会静默不弹窗
+    }
+  }
+  switchView("caselibrary");
+  openCaseDetail(id);
+}
+
 function renderChatMessages() {
   const box = document.getElementById("chatMessages");
   box.innerHTML = "";
@@ -462,12 +494,35 @@ function renderChatMessages() {
       "你好，我是思政案例生成工作台的AI助手 👋\n可以直接跟我说要生成或修改案例的哪部分，比如「帮我生成案例3.4的初稿」「把教学设计部分再具体一点」「审核通过这个案例」。素材导入、文档拆分在「📂 素材库」，最终审阅导出在「📚 案例库」。左侧栏可以新建/切换/删除历史对话。");
   }
 
+  // 工具结果消息里只带tool_use_id，要靠这个映射才知道对应的是哪个工具调用
+  const toolNameById = {};
+  for (const msg of chatHistory) {
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (const b of msg.content) {
+        if (b.type === "tool_use") toolNameById[b.id] = b.name;
+      }
+    }
+  }
+
   for (const msg of chatHistory) {
     if (msg.role === "user") {
       if (typeof msg.content === "string") {
         addBubble(box, "user", stripContextPrefix(msg.content));
       } else {
-        addToolChip(box, "⚙️ 工具执行完成");
+        let shownCaseLink = false;
+        for (const block of msg.content) {
+          if (block.type !== "tool_result") continue;
+          if (CASE_LINK_TOOLS.has(toolNameById[block.tool_use_id])) {
+            try {
+              const parsed = JSON.parse(block.content);
+              if (parsed && parsed.id && !parsed.error) {
+                addCaseLinkChip(box, parsed);
+                shownCaseLink = true;
+              }
+            } catch (e) { /* 不是预期的案例JSON，走下面兜底展示 */ }
+          }
+        }
+        if (!shownCaseLink) addToolChip(box, "⚙️ 工具执行完成");
       }
     } else if (msg.role === "assistant") {
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
@@ -555,10 +610,7 @@ async function sendChat(overrideText) {
   if (overrideText === undefined) input.value = "";
   if (!currentSessionId) await createNewSession();
 
-  const caseCode = document.getElementById("caseCode").value.trim();
-  const dimension = document.getElementById("dimensionSelect").value;
-
-  chatHistory.push({ role: "user", content: rawText }); // 乐观展示，不带隐藏上下文前缀
+  chatHistory.push({ role: "user", content: rawText });
   renderChatMessages();
   setChatLoading(true);
 
@@ -577,7 +629,7 @@ async function sendChat(overrideText) {
     const res = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: currentSessionId, message: rawText, case_code: caseCode, dimension }),
+      body: JSON.stringify({ session_id: currentSessionId, message: rawText }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -644,16 +696,14 @@ async function sendChat(overrideText) {
 }
 
 function sendSelectedToAgent() {
-  const dimension = document.getElementById("dimensionSelect").value;
   const ids = Array.from(selectedMaterialIds);
   if (ids.length === 0) {
     toast("请先在素材库里勾选至少一条抓取/解析成功的素材");
     return;
   }
 
-  // 案例编号必须跟着勾选的素材走，不能用顶部那个可能完全无关的默认输入框——
-  // 之前就是因为这里读顶部#caseCode（默认值"3.4"没人特意去改），导致不管勾的是哪个案例的素材，
-  // 发给AI的案例编号永远是3.4
+  // 案例编号跟着勾选的素材自己的case_code走，不能凭空指定——勾选的素材如果分属不同案例，
+  // 没法判断这次生成到底该算哪个案例的，让用户只选同一个案例下的素材
   const selectedMaterials = materialsCache.filter(m => selectedMaterialIds.has(m.id));
   const caseCodes = [...new Set(selectedMaterials.map(m => m.case_code).filter(Boolean))];
   if (caseCodes.length === 0) {
@@ -665,18 +715,9 @@ function sendSelectedToAgent() {
     return;
   }
   const caseCode = caseCodes[0];
-  document.getElementById("caseCode").value = caseCode; // 同步顶部AI助手上下文，避免文案里说的案例编号和实际发给AI的上下文对不上
 
   switchView("chat");
-  sendChat(`请用素材ID ${JSON.stringify(ids)} 生成案例${caseCode}的初稿，思政维度是"${dimension}"。`);
-}
-
-/* ================= 维度 ================= */
-async function loadDimensions() {
-  const res = await fetch(`${API_BASE}/api/dimensions`);
-  const dims = await res.json();
-  const sel = document.getElementById("dimensionSelect");
-  sel.innerHTML = dims.map(d => `<option value="${d}">${d}</option>`).join("");
+  sendChat(`请用素材ID ${JSON.stringify(ids)} 生成案例${caseCode}的初稿。`);
 }
 
 /* ================= 素材库：URL 导入 ================= */
@@ -723,13 +764,11 @@ function wireDropzone(zoneId, inputId, onFiles) {
 
 async function uploadFile(file) {
   const caseCode = document.getElementById("materialCaseCode").value.trim();
-  const dimension = document.getElementById("dimensionSelect").value;
   if (!caseCode) { toast("请先填写素材所属的案例编号"); return; }
   if (!/\.(docx|pdf)$/i.test(file.name)) { toast("仅支持 .docx 或 .pdf 文件"); return; }
 
   const formData = new FormData();
   formData.append("case_code", caseCode);
-  formData.append("dimension", dimension);
   formData.append("file", file);
 
   document.getElementById("uploadLoading").style.display = "block";
@@ -749,7 +788,7 @@ async function uploadFile(file) {
 
 /* ================= 素材库：列表 ================= */
 const SOURCE_ICON = { url: "🔗", docx: "📝", pdf: "📄" };
-const SIX_DIMENSIONS = ["家国情怀", "人文素养", "科学精神", "深度学习", "人格发展", "实践创新"];
+const SIZHENG_DIMENSIONS = ["政治认同", "家国情怀", "文化素养", "宪法法治意识", "道德修养"];
 
 async function loadMaterialCaseCodes() {
   const res = await fetch(`${API_BASE}/api/materials/case_codes`);
@@ -1057,10 +1096,13 @@ function renderCaseDetailHTML(c) {
     </table>
 
     <div class="section-title">③ 课程思政元素</div>
+    <div style="margin:6px 0;"><strong>对应维度：</strong>${escHtml(se["对应维度"] || "")}</div>
     <table>
-      <tr><th>对应维度</th><td>${escHtml(se["对应维度"] || "")}</td></tr>
-      <tr><th>摘录表述</th><td>${escHtml(se["摘录表述"] || "")}</td></tr>
-      ${SIX_DIMENSIONS.map(dim => `<tr><th>${escHtml(dim)}</th><td>${escHtml((se["六维度体现"] || {})[dim] || "")}</td></tr>`).join("")}
+      <tr><th>维度</th><th>摘录表述</th><th>解释</th></tr>
+      ${SIZHENG_DIMENSIONS.map(dim => {
+        const detail = (se["五维度阐释"] || {})[dim] || {};
+        return `<tr><th>${escHtml(dim)}</th><td>${escHtml(detail["摘录表述"] || "")}</td><td>${escHtml(detail["解释"] || "")}</td></tr>`;
+      }).join("")}
     </table>
 
     <div class="section-title">④ 适用课程举例</div>
@@ -1135,8 +1177,11 @@ function renderCaseEditHTML(c) {
 
     <div class="section-title">③ 课程思政元素</div>
     <label>对应维度</label><input type="text" id="edit_se_dimension" value="${escHtml(se["对应维度"] || "")}">
-    <label>摘录表述</label><textarea id="edit_se_excerpt" rows="2">${escHtml(se["摘录表述"] || "")}</textarea>
-    ${SIX_DIMENSIONS.map((dim, i) => `<label>六维度体现 - ${escHtml(dim)}</label><textarea id="edit_sixdim_${i}" rows="2">${escHtml((se["六维度体现"] || {})[dim] || "")}</textarea>`).join("")}
+    ${SIZHENG_DIMENSIONS.map((dim, i) => {
+      const detail = (se["五维度阐释"] || {})[dim] || {};
+      return `<label>${escHtml(dim)} - 摘录表述</label><input type="text" id="edit_dim_excerpt_${i}" value="${escHtml(detail["摘录表述"] || "")}">`
+        + `<label>${escHtml(dim)} - 解释</label><textarea id="edit_dim_explain_${i}" rows="2">${escHtml(detail["解释"] || "")}</textarea>`;
+    }).join("")}
 
     <div class="section-title">④ 适用课程举例</div>
     <div id="editCoursesTable">${renderCourseRowsHTML()}</div>
@@ -1250,9 +1295,11 @@ async function saveCaseEdit() {
     },
     sizheng_elements: {
       "对应维度": document.getElementById("edit_se_dimension").value,
-      "摘录表述": document.getElementById("edit_se_excerpt").value,
-      "六维度体现": Object.fromEntries(
-        SIX_DIMENSIONS.map((dim, i) => [dim, document.getElementById(`edit_sixdim_${i}`).value])
+      "五维度阐释": Object.fromEntries(
+        SIZHENG_DIMENSIONS.map((dim, i) => [dim, {
+          "摘录表述": document.getElementById(`edit_dim_excerpt_${i}`).value,
+          "解释": document.getElementById(`edit_dim_explain_${i}`).value,
+        }])
       ),
     },
     applicable_courses: editCourseRows
@@ -1341,6 +1388,47 @@ function populateCourseFilter() {
   if (courses.includes(prev)) sel.value = prev;
 }
 
+async function deleteKnowledgeByCourse() {
+  const courseName = document.getElementById("courseFilterSelect").value;
+  if (!courseName) { toast("请先在上面选一门具体的课程再删除"); return; }
+  if (!confirm(`确定删除课程《${courseName}》下的全部知识点吗？删除后不可恢复。`)) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "删除失败");
+    toast(`已删除《${courseName}》下 ${data.count} 条知识点`);
+    loadKnowledgePoints();
+  } catch (e) {
+    toast("删除出错: " + e.message);
+  }
+}
+
+async function addKnowledgePointManually() {
+  const course_name = document.getElementById("newKpCourse").value.trim();
+  const chapter = document.getElementById("newKpChapter").value.trim();
+  const description = document.getElementById("newKpDescription").value.trim();
+  if (!course_name || !description) { toast("课程名称和知识点描述不能为空"); return; }
+  try {
+    const res = await fetch(`${API_BASE}/api/knowledge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ course_name, chapter, description }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "添加失败");
+    knowledgePointsCache.unshift(data);
+    document.getElementById("newKpChapter").value = "";
+    document.getElementById("newKpDescription").value = "";
+    populateCourseFilter();
+    renderKnowledgeList();
+    toast("已添加");
+  } catch (e) {
+    toast("添加出错: " + e.message);
+  }
+}
+
+let editingKnowledgeId = null;
+
 function renderKnowledgeList() {
   const el = document.getElementById("knowledgeList");
   const filter = document.getElementById("courseFilterSelect").value;
@@ -1350,9 +1438,86 @@ function renderKnowledgeList() {
     return;
   }
   el.innerHTML = `<table>
-    <tr><th>课程</th><th>章节</th><th>知识点描述</th><th>来源文件</th></tr>
-    ${list.map(k => `<tr><td>${escHtml(k.course_name)}</td><td>${escHtml(k.chapter || "")}</td><td>${escHtml(k.description)}</td><td style="color:#888;">${escHtml(k.source_filename || "")}</td></tr>`).join("")}
+    <tr><th>课程</th><th>章节</th><th>知识点描述</th><th>来源文件</th><th></th></tr>
+    ${list.map(k => k.id === editingKnowledgeId ? renderKnowledgeEditRow(k) : renderKnowledgeRow(k)).join("")}
   </table>`;
+}
+
+function renderKnowledgeRow(k) {
+  return `<tr>
+    <td>${escHtml(k.course_name)}</td>
+    <td>${escHtml(k.chapter || "")}</td>
+    <td>${escHtml(k.description)}</td>
+    <td style="color:#888;">${escHtml(k.source_filename || "")}</td>
+    <td style="white-space:nowrap;">
+      <button class="link-btn" onclick="startEditKnowledge(${k.id})">✏️ 编辑</button>
+      <button class="link-btn" style="color:#b3282d;" onclick="deleteKnowledgePoint(${k.id})">🗑 删除</button>
+    </td>
+  </tr>`;
+}
+
+function renderKnowledgeEditRow(k) {
+  return `<tr>
+    <td><input type="text" id="kp_course_${k.id}" value="${escHtml(k.course_name)}"></td>
+    <td><input type="text" id="kp_chapter_${k.id}" value="${escHtml(k.chapter || "")}"></td>
+    <td><textarea id="kp_desc_${k.id}" rows="2">${escHtml(k.description)}</textarea></td>
+    <td style="color:#888;">${escHtml(k.source_filename || "")}</td>
+    <td style="white-space:nowrap;">
+      <button class="link-btn" onclick="saveKnowledgeEdit(${k.id})">💾 保存</button>
+      <button class="link-btn" onclick="cancelEditKnowledge()">取消</button>
+    </td>
+  </tr>`;
+}
+
+function startEditKnowledge(id) {
+  editingKnowledgeId = id;
+  renderKnowledgeList();
+}
+
+function cancelEditKnowledge() {
+  editingKnowledgeId = null;
+  renderKnowledgeList();
+}
+
+async function saveKnowledgeEdit(id) {
+  const payload = {
+    course_name: document.getElementById(`kp_course_${id}`).value.trim(),
+    chapter: document.getElementById(`kp_chapter_${id}`).value.trim(),
+    description: document.getElementById(`kp_desc_${id}`).value.trim(),
+  };
+  if (!payload.description) { toast("知识点描述不能为空"); return; }
+  try {
+    const res = await fetch(`${API_BASE}/api/knowledge/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "保存失败");
+    const idx = knowledgePointsCache.findIndex(k => k.id === id);
+    if (idx >= 0) knowledgePointsCache[idx] = data;
+    editingKnowledgeId = null;
+    populateCourseFilter();
+    renderKnowledgeList();
+    toast("已保存");
+  } catch (e) {
+    toast("保存出错: " + e.message);
+  }
+}
+
+async function deleteKnowledgePoint(id) {
+  if (!confirm("确定删除这条知识点吗？删除后不可恢复。")) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/knowledge/${id}`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "删除失败");
+    knowledgePointsCache = knowledgePointsCache.filter(k => k.id !== id);
+    populateCourseFilter();
+    renderKnowledgeList();
+    toast("已删除");
+  } catch (e) {
+    toast("删除出错: " + e.message);
+  }
 }
 
 async function uploadKnowledgeFiles(files) {
@@ -1371,7 +1536,8 @@ async function uploadKnowledgeFiles(files) {
     const res = await fetch(`${API_BASE}/api/knowledge/upload`, { method: "POST", body: fd });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "上传失败");
-    let msg = `解析完成：${valid.length}个文件，共提取到 ${data.count} 条知识点`;
+    let msg = `解析完成：${valid.length}个文件，新增 ${data.count} 条知识点`;
+    if (data.skipped_duplicate_points) msg += `，跳过 ${data.skipped_duplicate_points} 条重复知识点`;
     if (data.errors && data.errors.length) msg += `；${data.errors.join("；")}`;
     toast(msg);
     loadKnowledgePoints();
@@ -1393,6 +1559,10 @@ async function runMatch() {
   const caseId = document.getElementById("matchCaseSelect").value;
   if (!caseId) { toast("请先在「案例库」里生成至少一个案例"); return; }
   currentMatchCaseId = parseInt(caseId);
+  const btn = document.getElementById("runMatchBtn");
+  const loadingEl = document.getElementById("matchLoading");
+  btn.disabled = true;
+  loadingEl.style.display = "block";
   try {
     const res = await fetch(`${API_BASE}/api/cases/${caseId}/match_knowledge`, { method: "POST" });
     const data = await res.json();
@@ -1402,48 +1572,85 @@ async function runMatch() {
     toast(`匹配完成，共 ${data.mappings.length} 条候选`);
   } catch (e) {
     toast("匹配出错: " + e.message);
+  } finally {
+    btn.disabled = false;
+    loadingEl.style.display = "none";
   }
 }
 
 function renderMappingTable() {
   const el = document.getElementById("mappingTable");
   if (!currentMappings || currentMappings.length === 0) {
-    el.innerHTML = '<div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、编辑融入方式建议</div>';
+    el.innerHTML = '<div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div>';
     return;
   }
   el.innerHTML = `<table>
-    <tr><th>知识点</th><th>相关度</th><th>融入方式建议</th><th>状态</th><th></th></tr>
+    <tr><th>知识点</th><th>相关度</th><th>融入方式建议</th><th>状态</th></tr>
     ${currentMappings.map(m => `
       <tr>
         <td>《${escHtml(m.course_name)}》${escHtml(m.chapter || "")}<br><span style="color:#888">${escHtml(m.description)}</span></td>
         <td>${m.relevance_score}</td>
-        <td><input type="text" id="sugg_${m.id}" value="${escHtml(m.suggestion_text || "")}"></td>
+        <td><div class="suggestion-preview" onclick="openSuggestionEdit(${m.id})" title="点击编辑">${
+          m.suggestion_text ? escHtml(m.suggestion_text) : '<span style="color:#aaa">点击填写融入方式建议…</span>'
+        }</div></td>
         <td>
-          <select id="status_${m.id}">
+          <select id="status_${m.id}" onchange="saveMappingStatus(${m.id})">
             <option value="推荐" ${m.status === "推荐" ? "selected" : ""}>推荐</option>
             <option value="已采纳" ${m.status === "已采纳" ? "selected" : ""}>已采纳</option>
             <option value="已拒绝" ${m.status === "已拒绝" ? "selected" : ""}>已拒绝</option>
           </select>
         </td>
-        <td><button class="link-btn" onclick="saveMapping(${m.id})">保存</button></td>
       </tr>`).join("")}
   </table>`;
 }
 
-async function saveMapping(id) {
-  const status = document.getElementById(`status_${id}`).value;
-  const suggestion_text = document.getElementById(`sugg_${id}`).value;
+function openSuggestionEdit(id) {
+  const m = currentMappings.find(x => x.id === id);
+  if (!m) return;
+  document.getElementById("previewTitle").textContent = "编辑融入方式建议";
+  document.getElementById("previewBody").innerHTML = `
+    <div style="margin-bottom:10px;color:#888;">《${escHtml(m.course_name)}》${escHtml(m.chapter || "")}<br>${escHtml(m.description)}</div>
+    <textarea id="suggestionEditArea" rows="8" style="width:100%;">${escHtml(m.suggestion_text || "")}</textarea>
+    <div style="margin-top:10px;text-align:right;">
+      <button class="secondary" onclick="closePreview()">取消</button>
+      <button onclick="saveSuggestionEdit(${id})">保存</button>
+    </div>`;
+  document.getElementById("previewModal").classList.add("active");
+}
+
+async function saveSuggestionEdit(id) {
+  const suggestion_text = document.getElementById("suggestionEditArea").value;
   try {
     const res = await fetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status, suggestion_text }),
+      body: JSON.stringify({ suggestion_text }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "保存失败");
-    toast("已保存");
     const idx = currentMappings.findIndex(m => m.id === id);
     if (idx >= 0) currentMappings[idx] = data;
+    renderMappingTable();
+    closePreview();
+    toast("已保存");
+  } catch (e) {
+    toast("保存出错: " + e.message);
+  }
+}
+
+async function saveMappingStatus(id) {
+  const status = document.getElementById(`status_${id}`).value;
+  try {
+    const res = await fetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "保存失败");
+    const idx = currentMappings.findIndex(m => m.id === id);
+    if (idx >= 0) currentMappings[idx] = data;
+    toast("已保存");
   } catch (e) {
     toast("保存出错: " + e.message);
   }
@@ -1451,21 +1658,16 @@ async function saveMapping(id) {
 
 async function enrichCurrentCase() {
   if (!currentMatchCaseId) { toast("请先选择案例并运行匹配"); return; }
-  try {
-    const res = await fetch(`${API_BASE}/api/cases/${currentMatchCaseId}/enrich`, { method: "POST" });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "补充失败");
-    toast("已根据已采纳的知识点补充「适用课程举例」和「教学设计」，可在「📚 案例库」查看详情确认");
-    loadCases();
-  } catch (e) {
-    toast("补充出错: " + e.message);
-  }
+  const caseObj = casesCache.find(c => c.id === currentMatchCaseId);
+  const caseLabel = caseObj ? `案例${caseObj.case_code}（案例ID: ${currentMatchCaseId}）` : `案例ID ${currentMatchCaseId}`;
+  await createNewSession();
+  switchView("chat");
+  sendChat(`请用已采纳的知识点，补充${caseLabel}的「适用课程举例」与「教学设计」两部分。`);
 }
 
 /* ================= 初始化 ================= */
 wireDropzone("dropzone", "fileInput", files => uploadFile(files[0]));
 wireDropzone("knowledgeDropzone", "knowledgeFileInput", uploadKnowledgeFiles);
-loadDimensions();
 renderSuggestions();
 loadSessions();
 </script>

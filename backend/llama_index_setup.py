@@ -14,5 +14,5 @@ def configure_llama_index():
     if _configured:
         return
     Settings.llm = get_llama_index_llm()
-    Settings.embed_model = get_llama_index_embed_model(text_type="document")
+    Settings.embed_model = get_llama_index_embed_model()
     _configured = True

@@ -14,11 +14,12 @@ from llama_index.core.schema import TextNode
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from llama_index_setup import configure_llama_index
-from ocr_utils import doc_is_scanned, ocr_page_lines
+from ocr_utils import doc_is_scanned, native_page_lines, ocr_page_lines
 from parse_document import extract_text_from_docx, extract_text_from_pdf
 from prompts import KNOWLEDGE_MATCH_SYSTEM_PROMPT, build_knowledge_match_prompt
 from qwen_client import get_client, require_api_key, CHAT_MODEL
 from syllabus_table_ocr import extract_units_and_points
+from syllabus_vision_ocr import extract_units_and_points as extract_units_and_points_vision
 
 load_dotenv()
 
@@ -36,10 +37,28 @@ FINE_TOP_K = 8          # 最终展示给用户的候选数
 # 大纲标题里常见的"课程名+大纲"套话，用于从标题里剥离出干净的课程名
 _COURSE_SUFFIX_RE = re.compile(r"(课程)?(教学)?大纲.*$")
 _BOOK_TITLE_RE = re.compile(r"《([^》]+)》")
+# "一、课程基本信息"里的"课程名称：xxx"字段——高校OBE大纲里几乎都有，比封面装饰性大标题
+# 靠谱得多：封面大标题常是艺术字/分行排版，OCR按坐标排序时顺序经常被打乱，"《...》"书名号
+# 正则容易把旁边不相关的文字（比如"课程教学大纲"这几个字）也框进去。这个字段后面通常紧跟
+# "/English翻译"或下一个编号字段（"3.课程类别"），用来界定课程名到哪里结束
+_COURSE_NAME_FIELD_RE = re.compile(r"课程名称?[，,：:]\s*([^/]{2,40}?)(?=/|[0-9]{1,2}[.\、]|$)")
+
+
+def _course_name_from_field(blob: str) -> str | None:
+    """从"课程名称：xxx"结构化字段里提取课程名，取不到返回None交给调用方走其他猜测方式"""
+    m = _COURSE_NAME_FIELD_RE.search(blob)
+    if not m:
+        return None
+    name = m.group(1).strip(" 　:：，,。")
+    return name or None
 
 
 def guess_course_name(filename: str, lines: list[tuple[str, bool]]) -> str:
     """从文档前几行的标题/正文里猜课程名，猜不出就退化用文件名"""
+    field_name = _course_name_from_field("".join(text for text, _ in lines[:20]))
+    if field_name:
+        return field_name
+
     for text, is_heading in lines[:5]:
         candidate = text.strip()
         if not candidate:
@@ -83,43 +102,61 @@ def _points_from_heading_lines(course_name: str, lines: list[tuple[str, bool]]) 
 
 
 def extract_knowledge_points(
-    filename: str, file_bytes: bytes, course_name_override: str | None = None
+    filename: str, file_path: str, course_name_override: str | None = None
 ) -> tuple[str, list[dict]]:
     """
+    file_path: 磁盘上的临时文件路径（调用方负责上传落盘和之后的清理），不是读进内存的bytes——
+    大纲PDF/Word体积可能到几百MB，整个读进内存在小内存服务器上容易顶不住。
     course_name_override 非空时直接采用（适合同一门课程分多个文件上传）；
     为空则自动从文档标题/文件名猜课程名（适合一次批量上传多门课程的大纲）。
     返回 (最终使用的课程名, 知识点列表)
 
     PDF分两条路径：
-    - 正常数字PDF（有文字层）：按标题分节的启发式（跟docx共用同一套逻辑）。
-    - 扫描版PDF（没有文字层，比如打印后扫描/拍照转的PDF）：这类没法按"标题样式"分节，
-      改用 syllabus_table_ocr 对"知识单元/教学内容(知识点)"表格做OCR+按列重建，
-      直接拿到 (章节, 知识点) 列表，不走标题分节那一套。
+    - 正常数字PDF（有文字层）：先尝试按坐标分列识别"知识单元/教学内容(知识点)"表格
+      （syllabus_table_ocr，免费、不用等大模型）；识别不出这种表格结构就退回到按标题
+      样式分节的启发式（跟docx共用同一套逻辑）。
+    - 扫描版PDF（没有文字层，比如打印后扫描/拍照转的PDF）：这类没有可靠的"标题样式"信息，
+      按坐标分列也常常因为窄列文字被拉伸变形而认错（尤其是英文单词）。改用
+      syllabus_vision_ocr：先用免费OCR定位"知识单元/实验单元"这两张表格分别在哪几页，
+      只把这几页截图发给视觉大模型识别——模型能结合上下文语义纠错，比逐字符OCR准得多。
     """
     lower_name = filename.lower()
     if lower_name.endswith(".docx"):
-        lines = extract_text_from_docx(file_bytes)
+        lines = extract_text_from_docx(file_path)
         course_name = _resolve_course_name(course_name_override, filename, lines)
         return course_name, _points_from_heading_lines(course_name, lines)
 
     if not lower_name.endswith(".pdf"):
         raise ValueError("仅支持 .docx 或 .pdf 文件")
 
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    doc = fitz.open(file_path)
     try:
         if doc.needs_pass and not doc.authenticate(""):
             raise ValueError("PDF已加密，无法在没有密码的情况下解析")
 
-        if doc_is_scanned(doc):
-            course_name = (
-                course_name_override.strip()
-                if course_name_override and course_name_override.strip()
-                else _guess_course_name_from_scanned_title(_ocr_first_page_lines(doc), filename)
-            )
+        scanned = doc_is_scanned(doc)
+
+        if scanned:
             try:
-                units_points = extract_units_and_points(doc)
+                units_points = extract_units_and_points_vision(doc)
             except Exception as e:
-                raise ValueError(f"这是一份扫描版PDF（没有文字层），OCR识别失败: {e}") from e
+                raise ValueError(f"这是一份扫描版PDF（没有文字层），表格识别失败: {e}") from e
+            course_name = _course_name_from_pdf_title(doc, ocr_page_lines, course_name_override, filename)
+            points = [
+                {"course_name": course_name, "chapter": chapter, "description": description}
+                for chapter, description in units_points
+                if MIN_KP_CHARS <= len(description) <= MAX_KP_CHARS
+            ]
+            return course_name, points
+
+        # 数字PDF：先试免费的按坐标分列，识别不出表格结构就静默回退到标题分节启发式
+        try:
+            units_points = extract_units_and_points(doc, native_page_lines)
+        except Exception:
+            units_points = []
+
+        if units_points:
+            course_name = _course_name_from_pdf_title(doc, native_page_lines, course_name_override, filename)
             points = [
                 {"course_name": course_name, "chapter": chapter, "description": description}
                 for chapter, description in units_points
@@ -129,26 +166,32 @@ def extract_knowledge_points(
     finally:
         doc.close()
 
-    lines = extract_text_from_pdf(file_bytes)
+    # 非扫描件、且没识别出"知识单元/知识点"表格结构的PDF：退回到原来的标题分节启发式
+    lines = extract_text_from_pdf(file_path)
     course_name = _resolve_course_name(course_name_override, filename, lines)
     return course_name, _points_from_heading_lines(course_name, lines)
 
 
-def _ocr_first_page_lines(doc) -> list[str]:
-    """扫描版PDF猜课程名用：只OCR第一页（标题一般在第一页），不用把全篇都跑一遍OCR"""
-    if len(doc) == 0:
-        return []
-    return [text for *_, text in ocr_page_lines(doc[0])]
+def _course_name_from_pdf_title(doc, get_page_lines, course_name_override, filename) -> str:
+    if course_name_override and course_name_override.strip():
+        return course_name_override.strip()
+    first_page_texts = [text for *_, text in get_page_lines(doc[0])] if len(doc) else []
+    return _guess_course_name_from_page_lines(first_page_texts, filename)
 
 
-def _guess_course_name_from_scanned_title(lines: list[str], filename: str) -> str:
-    """OCR识别扫描件标题时，"《课程名》"经常被从中间断成好几行（比如"《工业互联网"和
-    "后端技术》"分成两行），先把开头几行拼起来再找书名号，比逐行找更容易命中"""
-    blob = "".join(lines[:10])
+def _guess_course_name_from_page_lines(line_texts: list[str], filename: str) -> str:
+    """给按坐标定位的表格解析路径用课程名：这条路径没有"标题样式"这种概念，优先找
+    "一、课程基本信息"里的"课程名称：xxx"字段（结构化、可靠），找不到再退化找封面书名号
+    （艺术字封面标题OCR顺序常被打乱，容易框进不相关文字，只作为兜底），
+    再找不到就退化用guess_course_name的文件名兜底逻辑"""
+    blob = "".join(line_texts[:20])
+    field_name = _course_name_from_field(blob)
+    if field_name:
+        return field_name
     book_match = _BOOK_TITLE_RE.search(blob)
     if book_match:
         return book_match.group(1).strip()
-    return guess_course_name(filename, [(t, False) for t in lines])
+    return guess_course_name(filename, [(t, False) for t in line_texts])
 
 
 _index = None
@@ -177,6 +220,18 @@ def index_knowledge_point(kp) -> None:
         metadata={"course_name": kp.course_name, "chapter": kp.chapter or ""},
     )
     _get_index().insert_nodes([node])
+
+
+def remove_knowledge_point_from_index(kp_id: int) -> None:
+    _get_index().vector_store.delete_nodes([str(kp_id)])
+
+
+def reindex_knowledge_point(kp) -> None:
+    """编辑知识点描述后重新建索引。Chroma对已存在的id是"跳过不写"，不是"覆盖更新"——
+    实测过，同一个id直接insert_nodes()两次，向量库里存的还是第一次写入的旧文本，
+    所以编辑后必须先删掉旧向量再插入新的，不能指望insert_nodes自己处理更新语义"""
+    remove_knowledge_point_from_index(kp.id)
+    index_knowledge_point(kp)
 
 
 def match_case_to_knowledge(db, case) -> list[dict]:
