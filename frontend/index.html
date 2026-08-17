@@ -385,7 +385,7 @@
 <div class="cite-tooltip" id="citeTooltip"></div>
 
 <script>
-const API_BASE = "http://localhost:8082";
+const API_BASE = "http://localhost:8000";
 
 let materialsCache = [];
 let selectedMaterialIds = new Set();
@@ -1388,18 +1388,36 @@ function populateCourseFilter() {
   if (courses.includes(prev)) sel.value = prev;
 }
 
+async function _deleteKnowledgeByCourseRequest(courseName, force) {
+  const url = `${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}${force ? "&force=true" : ""}`;
+  const res = await fetch(url, { method: "DELETE" });
+  const data = await res.json();
+  if (!res.ok) {
+    const err = new Error(data.detail || "删除失败");
+    err.blocked = res.status === 409; // 409：这门课程下有知识点被案例引用，可以选择强制删除
+    throw err;
+  }
+  return data;
+}
+
 async function deleteKnowledgeByCourse() {
   const courseName = document.getElementById("courseFilterSelect").value;
   if (!courseName) { toast("请先在上面选一门具体的课程再删除"); return; }
   if (!confirm(`确定删除课程《${courseName}》下的全部知识点吗？删除后不可恢复。`)) return;
   try {
-    const res = await fetch(`${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}`, { method: "DELETE" });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "删除失败");
+    const data = await _deleteKnowledgeByCourseRequest(courseName, false);
     toast(`已删除《${courseName}》下 ${data.count} 条知识点`);
     loadKnowledgePoints();
   } catch (e) {
-    toast("删除出错: " + e.message);
+    if (!e.blocked) { toast("删除出错: " + e.message); return; }
+    if (!confirm(`${e.message}\n\n要强制删除吗？会一并解除这些案例对应的知识点关联。`)) return;
+    try {
+      const data = await _deleteKnowledgeByCourseRequest(courseName, true);
+      toast(`已强制删除《${courseName}》下 ${data.count} 条知识点，同时解除了 ${data.removed_mappings} 条案例关联`);
+      loadKnowledgePoints();
+    } catch (e2) {
+      toast("删除出错: " + e2.message);
+    }
   }
 }
 
@@ -1505,18 +1523,40 @@ async function saveKnowledgeEdit(id) {
   }
 }
 
+async function _deleteKnowledgePointRequest(id, force) {
+  const url = `${API_BASE}/api/knowledge/${id}${force ? "?force=true" : ""}`;
+  const res = await fetch(url, { method: "DELETE" });
+  const data = await res.json();
+  if (!res.ok) {
+    const err = new Error(data.detail || "删除失败");
+    err.blocked = res.status === 409; // 409：这条知识点被案例引用，可以选择强制删除
+    throw err;
+  }
+  return data;
+}
+
+function _onKnowledgePointDeleted(id) {
+  knowledgePointsCache = knowledgePointsCache.filter(k => k.id !== id);
+  populateCourseFilter();
+  renderKnowledgeList();
+}
+
 async function deleteKnowledgePoint(id) {
   if (!confirm("确定删除这条知识点吗？删除后不可恢复。")) return;
   try {
-    const res = await fetch(`${API_BASE}/api/knowledge/${id}`, { method: "DELETE" });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "删除失败");
-    knowledgePointsCache = knowledgePointsCache.filter(k => k.id !== id);
-    populateCourseFilter();
-    renderKnowledgeList();
+    await _deleteKnowledgePointRequest(id, false);
+    _onKnowledgePointDeleted(id);
     toast("已删除");
   } catch (e) {
-    toast("删除出错: " + e.message);
+    if (!e.blocked) { toast("删除出错: " + e.message); return; }
+    if (!confirm(`${e.message}\n\n要强制删除吗？会一并解除这些案例对应的知识点关联。`)) return;
+    try {
+      const data = await _deleteKnowledgePointRequest(id, true);
+      _onKnowledgePointDeleted(id);
+      toast(`已强制删除，同时解除了 ${data.removed_mappings} 条案例关联`);
+    } catch (e2) {
+      toast("删除出错: " + e2.message);
+    }
   }
 }
 

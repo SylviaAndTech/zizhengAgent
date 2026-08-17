@@ -1,7 +1,7 @@
 """
 FastAPI 主入口
 提供：素材导入、案例生成、案例查询/编辑/审核 等接口
-运行方式: uvicorn main:app --reload --port 8082
+运行方式: uvicorn main:app --reload --port 8000
 """
 import io
 import json
@@ -691,13 +691,63 @@ def create_knowledge_point(req: CreateKnowledgePointRequest, db: Session = Depen
     }
 
 
+def _blocking_mappings_detail(db: Session, point_ids: list[int]) -> str | None:
+    """知识点被某个案例的知识点关联(case_knowledge_mappings)引用着的话，数据库外键约束
+    不允许直接删除该知识点——这里在真正执行删除之前先查一遍，返回一句人话说明是被哪个
+    案例的哪条关联卡住了，没有就返回None；不然任由IntegrityError原始报错抛给前端，
+    用户完全看不出是哪个案例、哪条知识点导致删不掉"""
+    mappings = (
+        db.query(CaseKnowledgeMapping)
+        .filter(CaseKnowledgeMapping.knowledge_point_id.in_(point_ids))
+        .all()
+    )
+    if not mappings:
+        return None
+    # 同一个知识点跟同一个案例之间可能同时存在"推荐"和"已采纳"两条关联记录，
+    # 按(知识点,案例)去重，不然消息里会把同一个案例重复报好几遍
+    seen = set()
+    parts = []
+    for m in mappings:
+        key = (m.knowledge_point_id, m.case_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        kp = m.knowledge_point
+        case = m.case
+        kp_desc = kp.description if kp else "(知识点已不存在)"
+        if len(kp_desc) > 30:
+            kp_desc = kp_desc[:30] + "…"
+        case_label = f"案例{case.case_code}《{case.title or ''}》" if case else f"案例(id={m.case_id})"
+        parts.append(f"知识点「{kp_desc}」(id={m.knowledge_point_id}) 关联着 {case_label}")
+    return (
+        "；".join(parts)
+        + "。如果确实要删除，可以强制删除——会连同这些案例对应的知识点关联一并解除，"
+        "这些案例会因此缺失对应的知识点关联信息。"
+    )
+
+
 @app.delete("/api/knowledge")
-def delete_knowledge_by_course(course_name: str, db: Session = Depends(get_db)):
-    """删掉一门课程下的全部知识点（连带向量索引），用于整门课程的大纲要重新导入或者传错课程了的场景"""
+def delete_knowledge_by_course(course_name: str, force: bool = False, db: Session = Depends(get_db)):
+    """删掉一门课程下的全部知识点（连带向量索引），用于整门课程的大纲要重新导入或者传错课程了的场景。
+    force=True 时，如果知识点被某个案例的知识点关联引用着，连同这些关联记录一并删除
+    （否则数据库外键约束不允许删除被引用的知识点）"""
     points = db.query(KnowledgePoint).filter(KnowledgePoint.course_name == course_name).all()
     if not points:
         raise HTTPException(404, "没有找到这门课程的知识点")
     point_ids = [k.id for k in points]
+
+    blocking_detail = _blocking_mappings_detail(db, point_ids)
+    if blocking_detail and not force:
+        raise HTTPException(409, f"这门课程下有知识点已经被案例引用，无法删除：{blocking_detail}")
+
+    removed_mappings = 0
+    if force:
+        removed_mappings = (
+            db.query(CaseKnowledgeMapping)
+            .filter(CaseKnowledgeMapping.knowledge_point_id.in_(point_ids))
+            .delete(synchronize_session=False)
+        )
+
     db.query(KnowledgePoint).filter(KnowledgePoint.id.in_(point_ids)).delete(synchronize_session=False)
     db.commit()
     for point_id in point_ids:
@@ -705,7 +755,7 @@ def delete_knowledge_by_course(course_name: str, db: Session = Depends(get_db)):
             remove_knowledge_point_from_index(point_id)
         except Exception as e:
             logger.warning(f"知识点(id={point_id})从向量库删除失败，语义检索可能还会召回它: {e}")
-    return {"deleted": True, "count": len(point_ids)}
+    return {"deleted": True, "count": len(point_ids), "removed_mappings": removed_mappings}
 
 
 @app.put("/api/knowledge/{point_id}")
@@ -736,17 +786,31 @@ def update_knowledge_point(point_id: int, req: UpdateKnowledgePointRequest, db: 
 
 
 @app.delete("/api/knowledge/{point_id}")
-def delete_knowledge_point(point_id: int, db: Session = Depends(get_db)):
+def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Depends(get_db)):
+    """force=True 时，如果这条知识点被某个案例的知识点关联引用着，连同这条关联记录一并删除"""
     kp = db.query(KnowledgePoint).filter(KnowledgePoint.id == point_id).first()
     if not kp:
         raise HTTPException(404, "知识点不存在")
+
+    blocking_detail = _blocking_mappings_detail(db, [point_id])
+    if blocking_detail and not force:
+        raise HTTPException(409, f"这条知识点已经被案例引用，无法删除：{blocking_detail}")
+
+    removed_mappings = 0
+    if force:
+        removed_mappings = (
+            db.query(CaseKnowledgeMapping)
+            .filter(CaseKnowledgeMapping.knowledge_point_id == point_id)
+            .delete(synchronize_session=False)
+        )
+
     db.delete(kp)
     db.commit()
     try:
         remove_knowledge_point_from_index(point_id)
     except Exception as e:
         logger.warning(f"知识点(id={point_id})从向量库删除失败，语义检索可能还会召回它: {e}")
-    return {"deleted": True}
+    return {"deleted": True, "removed_mappings": removed_mappings}
 
 
 @app.post("/api/cases/{case_id}/match_knowledge")
