@@ -15,7 +15,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 
 from db import (
@@ -649,18 +649,77 @@ def upload_knowledge(
 
 
 @app.get("/api/knowledge")
-def list_knowledge(course_name: str | None = None, db: Session = Depends(get_db)):
+def list_knowledge(
+    course_name: str | None = None,
+    q: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db),
+):
+    """q 非空时按关键字模糊匹配 课程名/章节/知识点描述 任一字段（跨课程搜索，忽略course_name）；
+    分页给前端"按课程折叠、展开后翻页"和"搜索结果扁平分页"两种视图共用"""
     query = db.query(KnowledgePoint)
-    if course_name:
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            or_(
+                KnowledgePoint.course_name.like(like),
+                KnowledgePoint.chapter.like(like),
+                KnowledgePoint.description.like(like),
+            )
+        )
+    elif course_name:
         query = query.filter(KnowledgePoint.course_name == course_name)
-    points = query.order_by(KnowledgePoint.id.desc()).all()
-    return [
+
+    total = query.count()
+    points = (
+        query.order_by(KnowledgePoint.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    point_ids = [k.id for k in points]
+    cases_by_point: dict[int, list[dict]] = {pid: [] for pid in point_ids}
+    if point_ids:
+        accepted = (
+            db.query(CaseKnowledgeMapping)
+            .filter(
+                CaseKnowledgeMapping.knowledge_point_id.in_(point_ids),
+                CaseKnowledgeMapping.status == "已采纳",
+            )
+            .all()
+        )
+        for m in accepted:
+            if not m.case:
+                continue
+            cases_by_point[m.knowledge_point_id].append({
+                "mapping_id": m.id, "case_id": m.case_id,
+                "case_code": m.case.case_code, "title": m.case.title,
+            })
+
+    items = [
         {
             "id": k.id, "course_name": k.course_name, "chapter": k.chapter,
             "description": k.description, "source_filename": k.source_filename,
+            "cases": cases_by_point.get(k.id, []),
         }
         for k in points
     ]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/api/knowledge/courses")
+def list_knowledge_courses(db: Session = Depends(get_db)):
+    """课程名+各自知识点数量，给知识点库折叠列表的课程标题行用——不用为了拿这份清单
+    去加载全部知识点正文"""
+    rows = (
+        db.query(KnowledgePoint.course_name, func.count(KnowledgePoint.id))
+        .group_by(KnowledgePoint.course_name)
+        .order_by(KnowledgePoint.course_name)
+        .all()
+    )
+    return [{"course_name": name, "count": count} for name, count in rows]
 
 
 @app.post("/api/knowledge")
@@ -876,6 +935,50 @@ def update_mapping(mapping_id: int, req: UpdateMappingRequest, db: Session = Dep
     db.commit()
     db.refresh(mapping)
     return mapping.to_dict()
+
+
+def _matching_applicable_course_entries(case: Case, kp: KnowledgePoint) -> list[dict]:
+    """案例"适用课程举例"里，课程名称+适用章节精确匹配这条知识点的条目——用来判断解绑这条
+    知识点关联时，案例里是不是已经写了对应这条知识点的内容，需要一并清理。
+    精确匹配的前提：这些条目是"用已采纳知识点补充适用课程举例"（enrich_case_with_accepted_knowledge）
+    写入的，字段原样来自知识点；如果案例的适用课程是当初生成案例时模型自己写的，可能存在同名但
+    实际无关、匹配不上的情况，这是已知的局限，不在这次处理范围内"""
+    entries = json.loads(case.applicable_courses or "[]")
+    return [
+        e for e in entries
+        if e.get("课程名称") == kp.course_name
+        and (not kp.chapter or e.get("适用章节") == kp.chapter)
+    ]
+
+
+@app.delete("/api/knowledge_mappings/{mapping_id}")
+def delete_knowledge_mapping(mapping_id: int, force: bool = False, db: Session = Depends(get_db)):
+    """解绑一条案例↔知识点关联。如果案例的"适用课程举例"里有对应这条知识点的条目，
+    force=False时先返回409说明情况，force=True时连同这些条目一并从案例里删掉"""
+    mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(404, "关联记录不存在")
+
+    case, kp = mapping.case, mapping.knowledge_point
+    matched = _matching_applicable_course_entries(case, kp) if case and kp else []
+
+    if matched and not force:
+        raise HTTPException(
+            409,
+            f"案例{case.case_code}《{case.title or ''}》的「适用课程举例」里有{len(matched)}条提到了"
+            f"这条知识点，解绑后会自动从中删除这些条目，确认要继续吗？",
+        )
+
+    db.delete(mapping)
+    removed = 0
+    if matched:
+        remaining = [e for e in json.loads(case.applicable_courses or "[]") if e not in matched]
+        old_value = case.applicable_courses
+        case.applicable_courses = json.dumps(remaining, ensure_ascii=False)
+        removed = len(matched)
+        log_case_change(db, case.id, "知识点解绑", {"applicable_courses": {"old": old_value, "new": case.applicable_courses}})
+    db.commit()
+    return {"unbound": True, "removed_course_entries": removed}
 
 
 @app.post("/api/cases/{case_id}/enrich")

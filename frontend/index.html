@@ -170,6 +170,17 @@
     border-radius: 4px; min-height: 1.6em;
   }
   .suggestion-preview:hover { background: #f2ece3; }
+  .kp-course-group { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; overflow: hidden; }
+  .kp-course-header {
+    display: flex; justify-content: space-between; align-items: center; padding: 8px 12px;
+    background: #f5f0ea; cursor: pointer; font-size: 13px; font-weight: 600;
+  }
+  .kp-course-header:hover { background: #efe7db; }
+  .kp-course-header .count { color: var(--muted); font-weight: 400; }
+  .kp-course-group table { margin-top: 0; border: none; border-radius: 0; }
+  .kp-case-chip { display: flex; align-items: center; gap: 6px; font-size: 12px; white-space: nowrap; }
+  .kp-case-chip + .kp-case-chip { margin-top: 3px; }
+  .kp-pager { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 12px; color: var(--muted); }
   .inline-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
   .inline-row > div { flex: 1; min-width: 160px; }
 
@@ -327,9 +338,13 @@
       <button class="secondary" style="margin:0;" onclick="loadKnowledgePoints()">刷新</button>
     </div>
     <div class="inline-row" style="margin-top:6px;">
+      <div style="flex:2;">
+        <label>搜索知识点（课程/章节/描述关键字，跨课程搜索）</label>
+        <input type="text" id="knowledgeSearchInput" placeholder="输入关键字..." oninput="onKnowledgeSearchInput(this.value)">
+      </div>
       <div>
-        <label>按课程筛选</label>
-        <select id="courseFilterSelect" onchange="renderKnowledgeList()"></select>
+        <label>按课程删除</label>
+        <select id="courseFilterSelect"></select>
       </div>
       <div style="flex:0;">
         <label>&nbsp;</label>
@@ -385,13 +400,12 @@
 <div class="cite-tooltip" id="citeTooltip"></div>
 
 <script>
-const API_BASE = "http://localhost:8000";
+const API_BASE = "http://localhost:8082";
 
 let materialsCache = [];
 let selectedMaterialIds = new Set();
 let casesCache = [];
 let selectedCaseIds = new Set();
-let knowledgePointsCache = [];
 let currentMatchCaseId = null;
 let currentMappings = [];
 let chatHistory = []; // 当前会话的 Anthropic messages 格式历史，随会话切换而替换
@@ -1372,20 +1386,92 @@ function exportBook() {
 }
 
 /* ================= 知识点匹配 ================= */
+/* 知识点库现在不再一次性把全部知识点缓存到本地——课程/知识点会持续增长，改成按课程折叠、
+   展开后分页拉取；有搜索关键字时切到跨课程的扁平分页结果。knowledgeCourses只存"课程名+
+   数量"，用来渲染折叠列表的标题行，不含知识点正文 */
+let knowledgeCourses = [];
+let expandedCourse = null;
+let expandedCourseData = { items: [], total: 0, page: 1, page_size: 20 };
+let knowledgeSearchQuery = "";
+let knowledgeSearchData = { items: [], total: 0, page: 1, page_size: 20 };
+let editingKnowledgeId = null;
+let _knowledgeSearchDebounceTimer = null;
+
 async function loadKnowledgePoints() {
-  const res = await fetch(`${API_BASE}/api/knowledge`);
-  knowledgePointsCache = await res.json();
+  const res = await fetch(`${API_BASE}/api/knowledge/courses`);
+  knowledgeCourses = await res.json();
   populateCourseFilter();
-  renderKnowledgeList();
+  if (knowledgeSearchQuery) {
+    await loadKnowledgeSearch(knowledgeSearchData.page || 1);
+  } else if (expandedCourse) {
+    await loadExpandedCourse(expandedCourse, expandedCourseData.page || 1);
+  } else {
+    renderKnowledgeList();
+  }
 }
 
 function populateCourseFilter() {
   const sel = document.getElementById("courseFilterSelect");
   const prev = sel.value;
-  const courses = [...new Set(knowledgePointsCache.map(k => k.course_name))];
-  sel.innerHTML = `<option value="">全部课程（共${knowledgePointsCache.length}条知识点）</option>` +
-    courses.map(c => `<option value="${escHtml(c)}">${escHtml(c)}（${knowledgePointsCache.filter(k => k.course_name === c).length}条）</option>`).join("");
-  if (courses.includes(prev)) sel.value = prev;
+  const total = knowledgeCourses.reduce((sum, c) => sum + c.count, 0);
+  sel.innerHTML = `<option value="">选择要删除的课程（共${total}条知识点）</option>` +
+    knowledgeCourses.map(c => `<option value="${escHtml(c.course_name)}">${escHtml(c.course_name)}（${c.count}条）</option>`).join("");
+  if (knowledgeCourses.some(c => c.course_name === prev)) sel.value = prev;
+}
+
+function onKnowledgeSearchInput(value) {
+  clearTimeout(_knowledgeSearchDebounceTimer);
+  _knowledgeSearchDebounceTimer = setTimeout(() => {
+    knowledgeSearchQuery = value.trim();
+    if (knowledgeSearchQuery) {
+      loadKnowledgeSearch(1);
+    } else {
+      renderKnowledgeList();
+    }
+  }, 300);
+}
+
+async function loadKnowledgeSearch(page) {
+  const res = await fetch(`${API_BASE}/api/knowledge?q=${encodeURIComponent(knowledgeSearchQuery)}&page=${page}&page_size=20`);
+  knowledgeSearchData = await res.json();
+  renderKnowledgeList();
+}
+
+async function toggleCourseExpand(courseName) {
+  if (expandedCourse === courseName) {
+    expandedCourse = null;
+    renderKnowledgeList();
+    return;
+  }
+  expandedCourse = courseName;
+  await loadExpandedCourse(courseName, 1);
+}
+
+async function loadExpandedCourse(courseName, page) {
+  const res = await fetch(`${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}&page=${page}&page_size=20`);
+  expandedCourseData = await res.json();
+  renderKnowledgeList();
+}
+
+function changeKnowledgePage(kind, page) {
+  if (page < 1) return;
+  if (kind === "search") loadKnowledgeSearch(page);
+  else loadExpandedCourse(expandedCourse, page);
+}
+
+/* 增/删/改知识点之后统一走这里刷新：课程名+数量列表，以及当前正打开的那个视图
+   （搜索结果 或 展开的课程），不用再手动维护本地缓存的增删改 */
+async function refreshKnowledgeView() {
+  const res = await fetch(`${API_BASE}/api/knowledge/courses`);
+  knowledgeCourses = await res.json();
+  populateCourseFilter();
+  if (knowledgeSearchQuery) {
+    await loadKnowledgeSearch(knowledgeSearchData.page || 1);
+  } else if (expandedCourse) {
+    await loadExpandedCourse(expandedCourse, expandedCourseData.page || 1);
+  } else {
+    renderKnowledgeList();
+  }
 }
 
 async function _deleteKnowledgeByCourseRequest(courseName, force) {
@@ -1407,14 +1493,16 @@ async function deleteKnowledgeByCourse() {
   try {
     const data = await _deleteKnowledgeByCourseRequest(courseName, false);
     toast(`已删除《${courseName}》下 ${data.count} 条知识点`);
-    loadKnowledgePoints();
+    if (expandedCourse === courseName) expandedCourse = null;
+    refreshKnowledgeView();
   } catch (e) {
     if (!e.blocked) { toast("删除出错: " + e.message); return; }
     if (!confirm(`${e.message}\n\n要强制删除吗？会一并解除这些案例对应的知识点关联。`)) return;
     try {
       const data = await _deleteKnowledgeByCourseRequest(courseName, true);
       toast(`已强制删除《${courseName}》下 ${data.count} 条知识点，同时解除了 ${data.removed_mappings} 条案例关联`);
-      loadKnowledgePoints();
+      if (expandedCourse === courseName) expandedCourse = null;
+      refreshKnowledgeView();
     } catch (e2) {
       toast("删除出错: " + e2.message);
     }
@@ -1434,31 +1522,69 @@ async function addKnowledgePointManually() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "添加失败");
-    knowledgePointsCache.unshift(data);
     document.getElementById("newKpChapter").value = "";
     document.getElementById("newKpDescription").value = "";
-    populateCourseFilter();
-    renderKnowledgeList();
+    // 展开这门课程、跳到第一页，方便用户直接看到刚加的这条（按id倒序排列，新增的在最前）
+    knowledgeSearchQuery = "";
+    document.getElementById("knowledgeSearchInput").value = "";
+    expandedCourse = course_name;
+    expandedCourseData.page = 1;
     toast("已添加");
+    refreshKnowledgeView();
   } catch (e) {
     toast("添加出错: " + e.message);
   }
 }
 
-let editingKnowledgeId = null;
-
 function renderKnowledgeList() {
   const el = document.getElementById("knowledgeList");
-  const filter = document.getElementById("courseFilterSelect").value;
-  const list = filter ? knowledgePointsCache.filter(k => k.course_name === filter) : knowledgePointsCache;
-  if (list.length === 0) {
+  if (knowledgeCourses.length === 0) {
     el.innerHTML = '<div class="empty-hint">还没有导入任何知识点，先上传课程教学大纲</div>';
     return;
   }
-  el.innerHTML = `<table>
-    <tr><th>课程</th><th>章节</th><th>知识点描述</th><th>来源文件</th><th></th></tr>
-    ${list.map(k => k.id === editingKnowledgeId ? renderKnowledgeEditRow(k) : renderKnowledgeRow(k)).join("")}
+  if (knowledgeSearchQuery) {
+    el.innerHTML = renderKnowledgeTable(knowledgeSearchData.items) + renderPager(knowledgeSearchData, "search");
+    return;
+  }
+  el.innerHTML = knowledgeCourses.map(c => {
+    const isOpen = expandedCourse === c.course_name;
+    return `<div class="kp-course-group">
+      <div class="kp-course-header" onclick='toggleCourseExpand(${JSON.stringify(c.course_name)})'>
+        <span>${isOpen ? "▼" : "▶"} ${escHtml(c.course_name)}</span>
+        <span class="count">${c.count} 条</span>
+      </div>
+      ${isOpen ? renderKnowledgeTable(expandedCourseData.items) + renderPager(expandedCourseData, "course") : ""}
+    </div>`;
+  }).join("");
+}
+
+function renderPager(data, kind) {
+  const totalPages = Math.max(1, Math.ceil(data.total / data.page_size));
+  if (totalPages <= 1) return "";
+  return `<div class="kp-pager">
+    <button class="link-btn" ${data.page <= 1 ? "disabled" : ""} onclick="changeKnowledgePage('${kind}', ${data.page - 1})">‹ 上一页</button>
+    <span>第 ${data.page} / ${totalPages} 页（共 ${data.total} 条）</span>
+    <button class="link-btn" ${data.page >= totalPages ? "disabled" : ""} onclick="changeKnowledgePage('${kind}', ${data.page + 1})">下一页 ›</button>
+  </div>`;
+}
+
+function renderKnowledgeTable(items) {
+  if (!items || items.length === 0) {
+    return '<div class="empty-hint">没有匹配的知识点</div>';
+  }
+  return `<table>
+    <tr><th>课程</th><th>章节</th><th>知识点描述</th><th>来源文件</th><th>关联案例</th><th></th></tr>
+    ${items.map(k => k.id === editingKnowledgeId ? renderKnowledgeEditRow(k) : renderKnowledgeRow(k)).join("")}
   </table>`;
+}
+
+function renderKnowledgeCasesCell(k) {
+  if (!k.cases || k.cases.length === 0) return '<span style="color:#aaa;">-</span>';
+  return k.cases.map(c => `
+    <div class="kp-case-chip">
+      <a href="javascript:void(0)" onclick="openCaseFromChat(${c.case_id})">案例${escHtml(c.case_code)}</a>
+      <button class="link-btn" style="color:#b3282d;" onclick="unbindKnowledgeCase(${c.mapping_id})">解绑</button>
+    </div>`).join("");
 }
 
 function renderKnowledgeRow(k) {
@@ -1467,6 +1593,7 @@ function renderKnowledgeRow(k) {
     <td>${escHtml(k.chapter || "")}</td>
     <td>${escHtml(k.description)}</td>
     <td style="color:#888;">${escHtml(k.source_filename || "")}</td>
+    <td>${renderKnowledgeCasesCell(k)}</td>
     <td style="white-space:nowrap;">
       <button class="link-btn" onclick="startEditKnowledge(${k.id})">✏️ 编辑</button>
       <button class="link-btn" style="color:#b3282d;" onclick="deleteKnowledgePoint(${k.id})">🗑 删除</button>
@@ -1480,6 +1607,7 @@ function renderKnowledgeEditRow(k) {
     <td><input type="text" id="kp_chapter_${k.id}" value="${escHtml(k.chapter || "")}"></td>
     <td><textarea id="kp_desc_${k.id}" rows="2">${escHtml(k.description)}</textarea></td>
     <td style="color:#888;">${escHtml(k.source_filename || "")}</td>
+    <td>${renderKnowledgeCasesCell(k)}</td>
     <td style="white-space:nowrap;">
       <button class="link-btn" onclick="saveKnowledgeEdit(${k.id})">💾 保存</button>
       <button class="link-btn" onclick="cancelEditKnowledge()">取消</button>
@@ -1512,12 +1640,9 @@ async function saveKnowledgeEdit(id) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "保存失败");
-    const idx = knowledgePointsCache.findIndex(k => k.id === id);
-    if (idx >= 0) knowledgePointsCache[idx] = data;
     editingKnowledgeId = null;
-    populateCourseFilter();
-    renderKnowledgeList();
     toast("已保存");
+    refreshKnowledgeView();
   } catch (e) {
     toast("保存出错: " + e.message);
   }
@@ -1535,27 +1660,52 @@ async function _deleteKnowledgePointRequest(id, force) {
   return data;
 }
 
-function _onKnowledgePointDeleted(id) {
-  knowledgePointsCache = knowledgePointsCache.filter(k => k.id !== id);
-  populateCourseFilter();
-  renderKnowledgeList();
-}
-
 async function deleteKnowledgePoint(id) {
   if (!confirm("确定删除这条知识点吗？删除后不可恢复。")) return;
   try {
     await _deleteKnowledgePointRequest(id, false);
-    _onKnowledgePointDeleted(id);
     toast("已删除");
+    refreshKnowledgeView();
   } catch (e) {
     if (!e.blocked) { toast("删除出错: " + e.message); return; }
     if (!confirm(`${e.message}\n\n要强制删除吗？会一并解除这些案例对应的知识点关联。`)) return;
     try {
       const data = await _deleteKnowledgePointRequest(id, true);
-      _onKnowledgePointDeleted(id);
       toast(`已强制删除，同时解除了 ${data.removed_mappings} 条案例关联`);
+      refreshKnowledgeView();
     } catch (e2) {
       toast("删除出错: " + e2.message);
+    }
+  }
+}
+
+async function _unbindKnowledgeMappingRequest(mappingId, force) {
+  const url = `${API_BASE}/api/knowledge_mappings/${mappingId}${force ? "?force=true" : ""}`;
+  const res = await fetch(url, { method: "DELETE" });
+  const data = await res.json();
+  if (!res.ok) {
+    const err = new Error(data.detail || "解绑失败");
+    err.blocked = res.status === 409; // 409：案例的"适用课程举例"里提到了这条知识点，可以选择连同一并删除
+    throw err;
+  }
+  return data;
+}
+
+async function unbindKnowledgeCase(mappingId) {
+  if (!confirm("确定要解绑这条知识点和案例的关联吗？")) return;
+  try {
+    await _unbindKnowledgeMappingRequest(mappingId, false);
+    toast("已解绑");
+    refreshKnowledgeView();
+  } catch (e) {
+    if (!e.blocked) { toast("解绑出错: " + e.message); return; }
+    if (!confirm(e.message)) return;
+    try {
+      const data = await _unbindKnowledgeMappingRequest(mappingId, true);
+      toast(`已解绑，同时从「适用课程举例」中删除了 ${data.removed_course_entries} 条相关内容`);
+      refreshKnowledgeView();
+    } catch (e2) {
+      toast("解绑出错: " + e2.message);
     }
   }
 }
