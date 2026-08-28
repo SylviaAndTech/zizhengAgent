@@ -7,7 +7,10 @@ AI 助手对话代理：用 LangChain 的 create_agent（内部基于 LangGraph�
 也可以是 [{"type":"text"/"tool_use"/"tool_result", ...}] 这种block列表）——
 这样不管内部用什么agent框架，前端的聊天渲染逻辑完全不用跟着改。
 """
+import contextvars
 import json
+import queue
+import threading
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -37,6 +40,18 @@ SYSTEM_PROMPT = f"""你是"思政案例生成工作台"的AI助手，帮助用�
 
 可用的思政维度：{", ".join(DIMENSIONS)}
 """
+
+# 案例生成这个工具耗时8-9分钟，用这个队列把"当前跑到第几步"从工具执行的线程实时传到
+# stream_chat()里跑SSE的那个消费循环，好在聊天界面上显示进度。用ContextVar而不是模块级
+# 全局变量，是因为如果两个用户同时在各自的聊天里触发生成，全局变量会导致进度串台；
+# ContextVar在stream_chat()新起的后台线程里各自独立设置，互不干扰。
+_progress_queue: contextvars.ContextVar = contextvars.ContextVar("progress_queue", default=None)
+
+
+def _emit_progress(stage: str):
+    q = _progress_queue.get()
+    if q is not None:
+        q.put(("progress", stage))
 
 
 @tool
@@ -110,7 +125,7 @@ def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
             for m in success_materials
         ]
         try:
-            draft = _generate_case_draft_impl(case_code, payload)
+            draft = _generate_case_draft_impl(case_code, payload, on_stage=_emit_progress)
         except ValueError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -119,6 +134,7 @@ def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
             dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
             title=draft.get("title"),
             full_narrative=draft.get("full_narrative"),
+            full_narrative_draft=draft.get("full_narrative_draft"),
             teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
             sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
             applicable_courses=json.dumps(draft.get("applicable_courses"), ensure_ascii=False),
@@ -312,9 +328,15 @@ def stream_chat(stored_messages: list[dict], user_message: str):
       用它的最后一次取值作为最终要落库的完整对话历史——这样不用自己拼工具调用参数/结果，
       直接复用和非流式版一样的、LangGraph已经组装好的准确状态。
 
+    真正的.stream()迭代放在后台线程（_run_agent）里跑，本函数只从队列里取事件转成yield——
+    这样案例生成这类耗时8-9分钟的工具调用执行期间，工具内部通过_emit_progress塞进同一个
+    队列的进度事件，能穿插在正常的token/tool_call事件之间实时冒出来，而不是让整个生成器
+    在工具调用返回之前完全没有任何输出。
+
     yield出的事件：
       {"type": "token", "text": ...}                          —— 增量文本，直接拼到当前气泡上
       {"type": "tool_call", "name": ...}                       —— 检测到一次工具调用，前端展示一个工具chip
+      {"type": "progress", "stage": ...}                       —— 耗时工具调用期间的阶段性进度（比如案例生成的四步）
       {"type": "done", "messages": [...], "reply": ...}        —— 流结束，附最终要落库的完整历史
       {"type": "error", "message": ...}                        —— 出错，调用方决定要不要落库当前进度
     """
@@ -323,42 +345,76 @@ def stream_chat(stored_messages: list[dict], user_message: str):
     history = _to_langchain_messages(stored_messages) if stored_messages else []
     history.append(HumanMessage(content=user_message))
 
+    q: queue.Queue = queue.Queue()
+
+    def _run_agent():
+        _progress_queue.set(q)  # ContextVar不会跨线程自动传播，要在新线程内部重新设置
+        try:
+            for mode, chunk in _get_agent().stream(
+                {"messages": history},
+                config={"recursion_limit": MAX_TOOL_ROUNDS * 2 + 1},
+                stream_mode=["messages", "values"],
+            ):
+                q.put(("event", mode, chunk))
+        except GraphRecursionError:
+            q.put(("recursion_error", None))
+        except Exception as e:
+            q.put(("exception", e))
+        finally:
+            q.put(("sentinel", None))
+
+    thread = threading.Thread(target=_run_agent, daemon=True)
+    thread.start()
+
     final_state = None
     seen_tool_call_ids = set()
 
-    try:
-        for mode, chunk in _get_agent().stream(
-            {"messages": history},
-            config={"recursion_limit": MAX_TOOL_ROUNDS * 2 + 1},
-            stream_mode=["messages", "values"],
-        ):
-            if mode == "values":
-                final_state = chunk
-                continue
+    while True:
+        item = q.get()
+        kind = item[0]
 
-            # mode == "messages"：chunk 是 (message_chunk, metadata)
-            msg_chunk, meta = chunk
-            if meta.get("langgraph_node") != "model":
-                continue  # 跳过tools节点吐出的ToolMessage整块内容，那个不是给用户逐字看的
+        if kind == "sentinel":
+            break
 
-            content = getattr(msg_chunk, "content", None)
-            if content:
-                yield {"type": "token", "text": content}
+        if kind == "recursion_error":
+            reply = "（工具调用次数过多，已中止，请换个更具体的说法重试）"
+            yield {"type": "token", "text": reply}
+            yield {"type": "done", "messages": _from_langchain_messages(history), "reply": reply}
+            return
 
-            for tc in (getattr(msg_chunk, "tool_call_chunks", None) or []):
-                tc_id = tc.get("id")
-                name = tc.get("name")
-                if name and tc_id and tc_id not in seen_tool_call_ids:
-                    seen_tool_call_ids.add(tc_id)
-                    yield {"type": "tool_call", "name": name}
-    except GraphRecursionError:
-        reply = "（工具调用次数过多，已中止，请换个更具体的说法重试）"
-        yield {"type": "token", "text": reply}
-        yield {"type": "done", "messages": _from_langchain_messages(history), "reply": reply}
-        return
-    except Exception as e:
-        yield {"type": "error", "message": str(e)}
-        return
+        if kind == "exception":
+            _, exc = item
+            yield {"type": "error", "message": str(exc)}
+            return
+
+        if kind == "progress":
+            _, stage = item
+            yield {"type": "progress", "stage": stage}
+            continue
+
+        # kind == "event"：item是("event", mode, chunk)，跟原来for循环里拿到的一样
+        _, mode, chunk = item
+        if mode == "values":
+            final_state = chunk
+            continue
+
+        # mode == "messages"：chunk 是 (message_chunk, metadata)
+        msg_chunk, meta = chunk
+        if meta.get("langgraph_node") != "model":
+            continue  # 跳过tools节点吐出的ToolMessage整块内容，那个不是给用户逐字看的
+
+        content = getattr(msg_chunk, "content", None)
+        if content:
+            yield {"type": "token", "text": content}
+
+        for tc in (getattr(msg_chunk, "tool_call_chunks", None) or []):
+            tc_id = tc.get("id")
+            name = tc.get("name")
+            if name and tc_id and tc_id not in seen_tool_call_ids:
+                seen_tool_call_ids.add(tc_id)
+                yield {"type": "tool_call", "name": name}
+
+    thread.join()
 
     updated_messages = final_state["messages"] if final_state else history
     reply = ""

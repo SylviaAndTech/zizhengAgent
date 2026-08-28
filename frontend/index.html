@@ -476,6 +476,28 @@ function addToolChip(container, text) {
   container.appendChild(div);
 }
 
+// 案例生成走四段式流水线，耗时8-9分钟；这个进度提示原地更新（不是每一步都新增一条消息），
+// 流结束后sendChat()会整体重渲染聊天框（按落库的chatHistory重建DOM），进度事件从不落库，
+// 所以这个临时chip到时候会被自然覆盖掉，不需要手动清理
+const GENERATION_STAGES = ["事实提炼", "正文初稿", "去AI味改写", "结构化字段"];
+let currentProgressChip = null;
+
+function resetProgressChip() {
+  currentProgressChip = null;
+}
+
+function updateProgressChip(container, stage) {
+  const idx = GENERATION_STAGES.indexOf(stage);
+  const label = idx >= 0 ? `⏳ ${stage}中 (${idx + 1}/${GENERATION_STAGES.length})` : `⏳ ${stage}中`;
+  if (!currentProgressChip || !currentProgressChip.isConnected) {
+    currentProgressChip = document.createElement("div");
+    currentProgressChip.className = "tool-chip";
+    container.appendChild(currentProgressChip);
+  }
+  currentProgressChip.textContent = label;
+  container.scrollTop = container.scrollHeight;
+}
+
 // 这两个工具调用成功后返回的是完整的案例对象（Case.to_dict()），可以直接给用户一个案例链接
 const CASE_LINK_TOOLS = new Set(["generate_case_draft", "update_case"]);
 
@@ -554,7 +576,7 @@ function renderChatMessages() {
 
 function setChatLoading(loading) {
   document.getElementById("chatStatusHint").textContent = loading
-    ? "AI助手正在处理中，如果涉及生成/改写全文可能需要10-30秒，请稍候..."
+    ? "AI助手正在处理中，如果涉及生成新案例（事实提炼→写正文→去AI味润色→补全其余字段，分四步走，正文现在要求写够2200字以上）实测可能需要10-20分钟，请不要关闭页面；其余的编辑/改写操作通常10-30秒，请稍候..."
     : "案例生成、逐段编辑、审核状态调整都可以直接在这里用自然语言完成；素材导入和最终导出仍在专门的标签页里。";
 }
 
@@ -677,8 +699,11 @@ async function sendChat(overrideText) {
           box.scrollTop = box.scrollHeight;
         } else if (payload.type === "tool_call") {
           flushBubble();
+          resetProgressChip(); // 每次新工具调用都重开一个进度chip，避免上一次生成的进度残留
           addToolChip(box, `🔧 调用工具：${payload.name}`);
           box.scrollTop = box.scrollHeight;
+        } else if (payload.type === "progress") {
+          updateProgressChip(box, payload.stage);
         } else if (payload.type === "error") {
           throw new Error(payload.message);
         } else if (payload.type === "done") {
@@ -1025,6 +1050,23 @@ function renderNarrativeWithCitations(caseId, text) {
   return html;
 }
 
+function toggleNarrativeDraft(caseId) {
+  const box = document.getElementById(`narrativeDraft_${caseId}`);
+  const toggle = document.getElementById(`narrativeDraftToggle_${caseId}`);
+  if (!box) return;
+  const showing = box.style.display !== "none";
+  box.style.display = showing ? "none" : "block";
+  if (toggle) toggle.innerHTML = `📝 查看"去AI味"改写前的初稿 ${showing ? "▼" : "▲"}`;
+}
+
+// 直引号/弯引号视为同一个字符再比较——去AI味改写那一步经常会顺手把正文里的引号统一成
+// 弯引号，偶尔连方括号[素材N:定位短语]标注里的字符也会跟着被改掉一两个，虽然已经在
+// prompt里明确要求不能动标注里的字符，但不能完全指望模型每次都严格遵守，这里做一层
+// 容错，不然这种情况下用户会看到"没能在原文里精确定位到这句引用"，明明内容其实是对的
+function _normalizeQuotes(s) {
+  return s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+}
+
 function showCiteTooltip(el) {
   const caseId = Number(el.dataset.caseId);
   const idx = Number(el.dataset.idx);
@@ -1040,7 +1082,12 @@ function showCiteTooltip(el) {
       tooltip.innerHTML = `<div class="ct-hint">没有找到"素材${idx}"，可能是案例正文标注有误</div>`;
     } else {
       const fullText = material.full_text || "";
-      const pos = anchor ? fullText.indexOf(anchor) : -1;
+      // 先按原文精确匹配；找不到再按"引号统一后"的版本匹配一次（两个字符串长度相同，
+      // 引号是1对1替换，匹配到的下标在原文里位置不变，可以直接复用来截取展示片段）
+      let pos = anchor ? fullText.indexOf(anchor) : -1;
+      if (pos < 0 && anchor) {
+        pos = _normalizeQuotes(fullText).indexOf(_normalizeQuotes(anchor));
+      }
       let snippetHtml;
       if (pos >= 0) {
         const start = Math.max(0, pos - 40);
@@ -1101,6 +1148,15 @@ function renderCaseDetailHTML(c) {
   return `
     <div class="section-title">① 完整案例</div>
     <div class="narrative-box">${renderNarrativeWithCitations(c.id, c.full_narrative || "")}</div>
+    ${c.full_narrative_draft ? `
+    <div style="margin-top:8px;">
+      <span class="suggestion-preview" id="narrativeDraftToggle_${c.id}" style="display:inline-block;color:var(--primary);" onclick="toggleNarrativeDraft(${c.id})">
+        📝 查看"去AI味"改写前的初稿 ▼
+      </span>
+      <div class="narrative-box" style="margin-top:6px;background:#f5f0ea;display:none;" id="narrativeDraft_${c.id}">
+        ${renderNarrativeWithCitations(c.id, c.full_narrative_draft)}
+      </div>
+    </div>` : ""}
 
     <div class="section-title">② 案例教学目标</div>
     <table>

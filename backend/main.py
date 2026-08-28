@@ -336,6 +336,7 @@ def generate_case(req: GenerateCaseRequest, db: Session = Depends(get_db)):
         dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
         title=draft.get("title"),
         full_narrative=draft.get("full_narrative"),
+        full_narrative_draft=draft.get("full_narrative_draft"),
         teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
         sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
         applicable_courses=json.dumps(draft.get("applicable_courses"), ensure_ascii=False),

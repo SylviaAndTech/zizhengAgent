@@ -65,7 +65,8 @@ class Case(Base):
     title = Column(Text)  # 生成的案例标题（要求不能与网上原文重复）
 
     # 以下字段存 JSON 字符串，简化SQLite schema，读取时用 json.loads
-    full_narrative = Column(Text)          # 完整案例（故事化叙述，含句级引用标注）
+    full_narrative = Column(Text)          # 完整案例（去AI味改写后的定稿，故事化叙述，含句级引用标注）
+    full_narrative_draft = Column(Text)    # 去AI味改写之前的正文初稿，跟full_narrative一起给用户对照查看
     teaching_objectives = Column(Text)     # 案例教学目标 {"知识":..,"能力":..,"素养":..}
     sizheng_elements = Column(Text)        # 课程思政元素，按五维度摘录 {dimension: text}
     applicable_courses = Column(Text)      # 适用课程举例 [{课程名称,适用章节,融入方式建议}]
@@ -92,6 +93,7 @@ class Case(Base):
             "dimension": self.dimension,
             "title": self.title,
             "full_narrative": self.full_narrative,
+            "full_narrative_draft": self.full_narrative_draft,
             "teaching_objectives": _load(self.teaching_objectives),
             "sizheng_elements": _load(self.sizheng_elements),
             "applicable_courses": _load(self.applicable_courses),
@@ -203,6 +205,7 @@ class CaseAuditLog(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_fetched_text_to_longtext()
+    _migrate_add_full_narrative_draft()
 
 
 def _migrate_fetched_text_to_longtext():
@@ -213,6 +216,17 @@ def _migrate_fetched_text_to_longtext():
             conn.execute(text("ALTER TABLE raw_materials MODIFY COLUMN fetched_text LONGTEXT"))
     except Exception as e:
         logging.getLogger("uvicorn.error").warning(f"fetched_text列类型迁移失败（不影响启动）: {e}")
+
+
+def _migrate_add_full_narrative_draft():
+    """create_all不会给已存在的表补新列——旧库的cases表还没有full_narrative_draft这一列，
+    这里补一次ALTER；已经有这一列时ALTER会报错，用try/except吞掉（跟上面fetched_text那个
+    迁移一样的写法），不影响启动。"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cases ADD COLUMN full_narrative_draft LONGTEXT"))
+    except Exception as e:
+        logging.getLogger("uvicorn.error").info(f"full_narrative_draft列已存在或迁移失败（不影响启动）: {e}")
 
 
 def get_db():

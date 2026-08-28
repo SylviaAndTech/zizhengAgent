@@ -23,6 +23,9 @@ DASHSCOPE_BASE_URL = "https://api.siliconflow.cn/v1"
 
 CHAT_MODEL = os.environ.get("QWEN_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 EMBEDDING_MODEL = os.environ.get("QWEN_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
+# 专门写案例"正文"用的模型——正文是全案例里最吃文笔的部分，值得单独换一个更强
+# （也更贵、更慢）的模型，其余结构化字段继续用上面更便宜快的CHAT_MODEL
+NARRATIVE_MODEL = os.environ.get("QWEN_NARRATIVE_MODEL", "deepseek-ai/DeepSeek-V4-Pro")
 MAX_TOOL_ROUNDS = int(os.environ.get("QWEN_MAX_TOOL_ROUNDS", "6"))
 
 _client = None
