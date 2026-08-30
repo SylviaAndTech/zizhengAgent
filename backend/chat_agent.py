@@ -18,10 +18,8 @@ from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
 from db import SessionLocal, RawMaterial, Case, CaseMaterial, CaseKnowledgeMapping, DIMENSIONS
-from generate_case import (
-    generate_case_draft as _generate_case_draft_impl,
-    enrich_case_with_knowledge as _enrich_case_with_knowledge_impl,
-)
+from generate_case import generate_case_draft as _generate_case_draft_impl
+from knowledge_matching import enrich_case_from_accepted_mappings as _enrich_case_from_accepted_mappings
 from material_index import search_materials as _search_materials_impl
 from qwen_client import get_langchain_llm, require_api_key, MAX_TOOL_ROUNDS
 from audit import log_case_change
@@ -137,9 +135,9 @@ def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
             full_narrative_draft=draft.get("full_narrative_draft"),
             teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
             sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
-            applicable_courses=json.dumps(draft.get("applicable_courses"), ensure_ascii=False),
-            teaching_design=json.dumps(draft.get("teaching_design"), ensure_ascii=False),
-            evaluation=json.dumps(draft.get("evaluation"), ensure_ascii=False),
+            # 适用课程举例/教学设计不在初次生成时产出了，等知识点匹配采纳后才会有内容
+            applicable_courses=None,
+            teaching_design=None,
             further_reading=json.dumps(draft.get("further_reading"), ensure_ascii=False),
             status="待审核",
         )
@@ -164,11 +162,11 @@ def update_case(
     sizheng_elements: dict = None,
     applicable_courses: list = None,
     teaching_design: dict = None,
-    evaluation: dict = None,
     further_reading: list = None,
     status: str = None,
 ) -> str:
     """更新某个案例的字段（比如修改标题、完整案例正文、教学设计等），只传需要修改的字段。
+    适用课程举例/教学设计通常由知识点匹配采纳后自动生成，不建议在这里手工瞎编；
     status 取值范围：草稿/待审核/已采纳/已驳回"""
     db = SessionLocal()
     try:
@@ -180,7 +178,7 @@ def update_case(
             "title": title, "full_narrative": full_narrative,
             "teaching_objectives": teaching_objectives, "sizheng_elements": sizheng_elements,
             "applicable_courses": applicable_courses, "teaching_design": teaching_design,
-            "evaluation": evaluation, "further_reading": further_reading, "status": status,
+            "further_reading": further_reading, "status": status,
         }
         changes = {}
         for field, value in fields.items():
@@ -206,47 +204,30 @@ def enrich_case_with_accepted_knowledge(case_id: int) -> str:
     """用某个案例在「知识点匹配」页面已经人工标记为"已采纳"的知识点关联，调用模型补充/更新
     这个案例的"适用课程举例"与"教学设计"两个字段，并直接写回数据库。这个案例必须已经跑过
     知识点匹配、且至少有一条被标记为"已采纳"，否则会返回error，如果报错就把这个情况告诉用户，
-    不要自己凭空编造适用课程举例/教学设计的内容。"""
+    不要自己凭空编造适用课程举例/教学设计的内容。
+    注意：现在采纳/取消采纳知识点关联时后台会自动触发这个逻辑，这个工具通常已经不需要
+    手动调用了，只有用户明确要求"重新生成"之类的场景才用得上。"""
     db = SessionLocal()
     try:
         case = db.query(Case).filter(Case.id == case_id).first()
         if not case:
             return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
 
-        accepted = (
+        has_accepted = (
             db.query(CaseKnowledgeMapping)
             .filter(CaseKnowledgeMapping.case_id == case_id, CaseKnowledgeMapping.status == "已采纳")
-            .all()
+            .first()
         )
-        if not accepted:
+        if not has_accepted:
             return json.dumps(
                 {"error": "这个案例还没有已采纳的知识点关联，请先在「知识点匹配」页面运行匹配并采纳至少一条"},
                 ensure_ascii=False,
             )
 
-        accepted_payload = [
-            {
-                "course_name": m.knowledge_point.course_name,
-                "chapter": m.knowledge_point.chapter,
-                "description": m.knowledge_point.description,
-                "suggestion_text": m.suggestion_text,
-            }
-            for m in accepted
-        ]
         try:
-            enrichment = _enrich_case_with_knowledge_impl(case.to_dict(), accepted_payload)
+            changes = _enrich_case_from_accepted_mappings(db, case)
         except ValueError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-        changes = {}
-        for field in ("applicable_courses", "teaching_design"):
-            if field not in enrichment:
-                continue
-            old_value = getattr(case, field, None)
-            new_value = json.dumps(enrichment[field], ensure_ascii=False)
-            if old_value != new_value:
-                changes[field] = {"old": old_value, "new": new_value}
-            setattr(case, field, new_value)
 
         db.commit()
         db.refresh(case)

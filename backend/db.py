@@ -11,7 +11,7 @@ import os
 
 from dotenv import load_dotenv
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, text
+    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, text
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
@@ -202,10 +202,55 @@ class CaseAuditLog(Base):
         }
 
 
+class User(Base):
+    """登录账号。现在只有一个固定的admin账号，但按多用户设计——以后加新用户只是插入
+    一行数据，不用改代码或表结构。"""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    password_hash = Column(String(200), nullable=False)  # 格式见 auth.py 的 hash_password()
+    is_active = Column(Boolean, default=True)  # 停用账号用这个字段软删除，不用真的删行
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    def to_dict(self):
+        return {"id": self.id, "username": self.username, "is_active": self.is_active}
+
+
+class UserSession(Base):
+    """登录会话：服务端保存token，前端登录后把token放Authorization请求头里带上
+    （不用cookie——前端和后端在开发环境是两个不同origin，跨源cookie在纯HTTP下受
+    SameSite/Secure策略限制很难用；token方案不受这个限制，实现也更简单）。"""
+    __tablename__ = "user_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_fetched_text_to_longtext()
     _migrate_add_full_narrative_draft()
+    _seed_default_admin()
+
+
+def _seed_default_admin():
+    """确保至少有一个admin账号能登录——幂等，重复调用（每次启动都会调）不会出错，
+    也不会覆盖已存在账号的密码，避免每次重启服务器都把管理员自己改过的密码悄悄重置回默认值。
+    实际的哈希逻辑在auth.py（这里延迟import，避免db.py和auth.py出现循环依赖：
+    auth.py里也需要用到本文件的User/UserSession）。"""
+    from auth import DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, hash_password
+    db = SessionLocal()
+    try:
+        exists = db.query(User).filter(User.username == DEFAULT_ADMIN_USERNAME).first()
+        if not exists:
+            db.add(User(username=DEFAULT_ADMIN_USERNAME, password_hash=hash_password(DEFAULT_ADMIN_PASSWORD)))
+            db.commit()
+    finally:
+        db.close()
 
 
 def _migrate_fetched_text_to_longtext():

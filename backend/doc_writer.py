@@ -76,11 +76,7 @@ def write_case_section(doc, case_dict: dict, heading_level: int = 1):
     for k, v in (d["teaching_design"] or {}).items():
         doc.add_paragraph(f"{k}：{v}")
 
-    doc.add_heading("六、课程评价与成效", level=sub)
-    for k, v in (d["evaluation"] or {}).items():
-        doc.add_paragraph(f"{k}：{v}")
-
-    doc.add_heading("七、延伸阅读", level=sub)
+    doc.add_heading("六、延伸阅读", level=sub)
     for r in (d["further_reading"] or []):
         doc.add_paragraph(f"[{r.get('type', '')}] {r.get('title', '')} {r.get('url', '')}")
 

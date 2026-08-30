@@ -308,3 +308,61 @@ def match_case_to_knowledge(db, case) -> list[dict]:
 
     results.sort(key=lambda x: x["relevance_score"], reverse=True)
     return results[:FINE_TOP_K]
+
+
+def enrich_case_from_accepted_mappings(db, case) -> dict:
+    """
+    案例当前"已采纳"的知识点关联集合发生变化后调用（不管是新采纳了一条、还是取消采纳了
+    一条，都要调这个函数重新算一遍）：
+    - 如果当前一条"已采纳"的关联都没有，"适用课程举例"和"教学设计"清空回"尚未生成"状态
+      （不留旧内容——旧内容对应的知识点可能已经不再是"已采纳"状态了，留着会误导）。
+    - 否则重新生成这两个字段：适用课程举例对已采纳的每一条知识点关联都生成一条；
+      教学设计只结合relevance_score最高的那一条来设计，不是把全部已采纳的糅在一起
+      （多个不相关的知识点糅进一份教学设计里会变得空泛、失焦）。
+
+    调用方负责commit/refresh/写审计日志——这个函数只改case对象的字段值、返回变化了
+    哪些字段（供写审计日志用），不落库、不处理事务边界。
+    返回值：{字段名: {"old":.., "new":..}, ...}，没有实际变化时返回空dict。
+    """
+    from db import CaseKnowledgeMapping  # 延迟import，避免和db.py出现循环依赖
+
+    accepted = (
+        db.query(CaseKnowledgeMapping)
+        .filter(CaseKnowledgeMapping.case_id == case.id, CaseKnowledgeMapping.status == "已采纳")
+        .order_by(CaseKnowledgeMapping.relevance_score.desc())
+        .all()
+    )
+    accepted_payload = [
+        {
+            "course_name": m.knowledge_point.course_name,
+            "chapter": m.knowledge_point.chapter,
+            "description": m.knowledge_point.description,
+            "suggestion_text": m.suggestion_text,
+            "relevance_score": m.relevance_score,
+        }
+        for m in accepted
+        if m.knowledge_point
+    ]
+
+    changes = {}
+    if not accepted_payload:
+        for field in ("applicable_courses", "teaching_design"):
+            old_value = getattr(case, field, None)
+            if old_value is not None:
+                changes[field] = {"old": old_value, "new": None}
+            setattr(case, field, None)
+        return changes
+
+    from generate_case import enrich_case_with_knowledge
+    enrichment = enrich_case_with_knowledge(case.to_dict(), accepted_payload)
+
+    for field in ("applicable_courses", "teaching_design"):
+        if field not in enrichment:
+            continue
+        old_value = getattr(case, field, None)
+        new_value = json.dumps(enrichment[field], ensure_ascii=False)
+        if old_value != new_value:
+            changes[field] = {"old": old_value, "new": new_value}
+        setattr(case, field, new_value)
+
+    return changes

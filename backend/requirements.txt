@@ -2,7 +2,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 openai==2.53.0  # langchain-openai==1.4.1 需要 openai>=2.45.0，这里跟着一起提了版本
 httpx[socks]==0.27.2  # 兜底：即便代码里已经禁用了httpx读取本机代理，也避免环境里缺socksio时报错
-requests==2.32.3
+requests==2.34.2  # langchain-community==0.4.2 需要 requests>=2.32.5，这里跟着一起提了版本
 trafilatura==1.12.2
 sqlalchemy==2.0.35
 pymysql==1.1.1
@@ -35,3 +35,11 @@ chromadb==1.5.9
 langchain==1.3.14
 langchain-openai==1.4.1
 langchain-core==1.5.3
+
+# 知识图谱：只用langchain_community.graphs.graph_document里的Node/Relationship/GraphDocument
+# 这几个数据结构类（LLMGraphTransformer的输出schema），用来表示案例↔知识点这个已经确定的
+# 结构化关系——不实际调用LLM去抽取关系（这层关系本来就在CaseKnowledgeMapping表里，
+# 用LLM去"猜"一个已经确定的关系没有意义，纯粹是复用LangChain这套图数据结构的表示方式）。
+# 注意：langchain-community这个包官方标注为"sunset中、不再积极维护"，但graph_document这个
+# 子模块只是几个轻量的pydantic数据类，没有用到包里其他被废弃的重度集成，可以放心用。
+langchain-community==0.4.2

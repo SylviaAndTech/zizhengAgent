@@ -16,6 +16,7 @@ import openai
 from prompts import (
     CASE_ENRICH_SYSTEM_PROMPT, build_enrich_prompt,
     FACT_EXTRACTION_SYSTEM_PROMPT, build_fact_extraction_prompt,
+    NARRATIVE_ARC_SYSTEM_PROMPT, build_narrative_arc_prompt,
     CASE_NARRATIVE_STYLE_PROMPT, build_narrative_user_message, build_ai_flavor_revision_prompt,
     CASE_STRUCTURED_FIELDS_SYSTEM_PROMPT, build_structured_fields_prompt,
 )
@@ -113,8 +114,26 @@ def _extract_facts(case_code: str, materials: list[dict]) -> dict:
     return _chat_json(FACT_EXTRACTION_SYSTEM_PROMPT, prompt, max_tokens=8000, temperature=0.1)
 
 
-def _write_narrative_draft(facts: dict) -> str:
-    """第②步：拿事实骨架写正文初稿（高温+风格规则+few-shot范文，用更强的NARRATIVE_MODEL）。
+def _suggest_narrative_arc(facts: dict) -> str:
+    """折中方案：给②一个轻量的"行文脉络建议"（先讲什么、再讲什么、怎么收尾的提纲式顺序，
+    不含具体句子、不含引用标注），单独用中等温度（0.3）生成，不跟①的精确摘抄共用一次调用
+    ——摘抄需要的低温（0.1，保证定位短语跟原文逐字匹配）和组织顺序建议需要的一点创造力
+    如果硬塞进同一次调用，两者会互相拖累：温度压低摘抄准了但骨架建议会很呆板，温度调高
+    骨架建议更合理但摘抄精度会下降。用CHAT_MODEL而不是NARRATIVE_MODEL，因为这一步是
+    "分析型"的顺序编排，不是正文本身的文学化写作，不需要为此多花钱用强模型。"""
+    # 要求的是100~200字一段话，但模型经常会写超；这里是纯文本调用（不是_chat_json），
+    # 截断了不会像JSON模式那样报JSONDecodeError，只会安安静静地返回一段被腰斩的建议，
+    # 没有任何报错信号——给足够宽裕的余量，避免这种不容易第一时间发现的静默截断
+    prompt = build_narrative_arc_prompt(facts)
+    return _chat_text(
+        NARRATIVE_ARC_SYSTEM_PROMPT, [{"role": "user", "content": prompt}], max_tokens=1500,
+        model=CHAT_MODEL, temperature=0.3,
+    )
+
+
+def _write_narrative_draft(facts: dict, narrative_arc: str | None = None) -> str:
+    """第②步：拿事实骨架（+可选的行文脉络建议）写正文初稿（高温+风格规则+few-shot范文，
+    用更强的NARRATIVE_MODEL）。
     few-shot范文现在还不按维度筛选——这一步案例最终会归到哪个思政维度，要等第④步结合
     定稿正文才判断得出来，第②步阶段还不知道，所以get_examples_by_dimension传None，
     退化成"现有全部范文都当通用文笔示范"，不影响使用（现在范文库本来也就2篇）"""
@@ -122,7 +141,7 @@ def _write_narrative_draft(facts: dict) -> str:
     for ex in get_examples_by_dimension(None, limit=2):
         messages.append({"role": "user", "content": build_narrative_user_message(ex["example_facts"])})
         messages.append({"role": "assistant", "content": ex["example_output"]})
-    messages.append({"role": "user", "content": build_narrative_user_message(facts)})
+    messages.append({"role": "user", "content": build_narrative_user_message(facts, narrative_arc)})
     # 正文要求2200~3000字，中文在DeepSeek系tokenizer上大约1字对应1~1.5 token，
     # 再算上几十个[素材N:定位短语]标注的开销，max_tokens给到8000留足余量，
     # 避免正文写到一半被截断（比空间不够更明显的信号是JSON模式下的Unterminated
@@ -173,8 +192,9 @@ def generate_case_draft(case_code: str, materials: list[dict], on_stage=None) ->
 
     _stage("事实提炼")
     facts = _extract_facts(case_code, materials)
+    narrative_arc = _suggest_narrative_arc(facts)
     _stage("正文初稿")
-    narrative_draft = _write_narrative_draft(facts)
+    narrative_draft = _write_narrative_draft(facts, narrative_arc)
     _stage("去AI味改写")
     narrative_final = _revise_ai_flavor(narrative_draft, facts)
     _stage("结构化字段")
@@ -189,7 +209,10 @@ def enrich_case_with_knowledge(case: dict, accepted_mappings: list[dict]) -> dic
     """
     根据人工采纳的知识点关联，补充/更新案例的"适用课程举例"与"教学设计"两个字段。
     case: Case.to_dict() 的结果
-    accepted_mappings: [{"course_name":.., "chapter":.., "description":.., "suggestion_text":..}, ...]
+    accepted_mappings: [{"course_name":.., "chapter":.., "description":.., "suggestion_text":..,
+    "relevance_score":..}, ...]，调用方要预先按relevance_score降序排好——适用课程举例会
+    对应列表里每一条各生成一条，教学设计只会结合排在第一条（相关度最高）的那条知识点来设计，
+    这个"哪条最相关"的判断是调用方排序决定的，不是让模型自己从分数里挑。
     """
     if not accepted_mappings:
         raise ValueError("没有已采纳的知识点关联，无法据此补充案例")

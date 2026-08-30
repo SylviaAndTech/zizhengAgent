@@ -11,23 +11,27 @@ import shutil
 import tempfile
 
 import docx
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 
 from db import (
     init_db, get_db, SessionLocal, RawMaterial, Case, CaseMaterial, DIMENSIONS,
-    KnowledgePoint, CaseKnowledgeMapping, ChatSession, CaseAuditLog,
+    KnowledgePoint, CaseKnowledgeMapping, ChatSession, CaseAuditLog, User,
+)
+from auth import (
+    AUTH_ENABLED, DEFAULT_ADMIN_USERNAME, verify_password,
+    create_session_token, get_user_from_token, delete_session_token,
 )
 from fetch_material import fetch_url_text
-from generate_case import generate_case_draft, enrich_case_with_knowledge
+from generate_case import generate_case_draft
 from parse_document import parse_uploaded_document
 from knowledge_matching import (
     extract_knowledge_points, match_case_to_knowledge, index_knowledge_point,
-    reindex_knowledge_point, remove_knowledge_point_from_index,
+    reindex_knowledge_point, remove_knowledge_point_from_index, enrich_case_from_accepted_mappings,
 )
 from chat_agent import stream_chat
 from audit import log_case_change
@@ -39,6 +43,40 @@ from material_index import index_material
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="思政案例生成工作台 - 原型")
+
+# ---------- 登录鉴权：所有/api/*接口默认都要求登录，登录本身这个接口除外 ----------
+# AUTH_ENABLED=false（.env里配）可以整体关掉这层校验，方便测试阶段不用每次都登录；
+# 上线前要确认.env里这个开关是打开的（默认就是true，不用特意配也行）。
+#
+# 这个中间件必须在下面app.add_middleware(CORSMiddleware...)之前注册——Starlette的中间件栈是
+# "后注册的在最外层"，如果CORS中间件先注册、auth中间件后注册，auth中间件会被包在CORS外面，
+# 它直接返回的401 JSONResponse就不会经过CORS中间件处理、不会带Access-Control-Allow-Origin
+# 响应头。前端(:5500)跨源请求受保护接口时，浏览器看到没有CORS头的401会直接判定为CORS错误、
+# 把响应体和状态码都藏起来不让JS读到，导致前端apiFetch()里"检查res.status===401"这行代码
+# 永远走不到（fetch()的promise会在CORS阶段就reject掉）。实测验证过这个顺序错了会复现这个问题，
+# 调换成现在这个顺序（auth先注册、在内层；CORS后注册、在外层）之后401响应能正确带上CORS头。
+_PUBLIC_API_PATHS = {"/api/auth/login"}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if not AUTH_ENABLED:
+        return await call_next(request)
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api/") or path in _PUBLIC_API_PATHS:
+        return await call_next(request)
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    db = SessionLocal()
+    try:
+        user = get_user_from_token(db, token)
+    finally:
+        db.close()
+    if not user:
+        return JSONResponse({"detail": "未登录或登录已过期，请重新登录"}, status_code=401)
+    request.state.user = user
+    return await call_next(request)
+
 
 # 默认只放开本机常用的静态服务端口；部署到其他地址时通过 CORS_ORIGINS（逗号分隔）覆盖
 _default_origins = "http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000"
@@ -54,6 +92,36 @@ app.add_middleware(
 init_db()
 # ChromaDB/LlamaIndex 的连接是懒加载的（第一次真正建索引/检索时才连），
 # 这里不用单独预热，连不上也不会拖垮后端启动，只会在用到时报错。
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username, User.is_active.is_(True)).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(401, "用户名或密码错误")
+    token = create_session_token(db, user)
+    return {"token": token, "username": user.username}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, db: Session = Depends(get_db)):
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    delete_session_token(db, token)
+    return {"logged_out": True}
+
+
+@app.get("/api/auth/me")
+def get_me(request: Request):
+    if not AUTH_ENABLED:
+        return {"username": DEFAULT_ADMIN_USERNAME, "auth_disabled": True}
+    user = request.state.user  # 走到这里说明auth_middleware已经校验通过，user一定存在
+    return {"username": user.username, "auth_disabled": False}
 
 
 # ---------- 请求体模型 ----------
@@ -75,7 +143,6 @@ class UpdateCaseRequest(BaseModel):
     sizheng_elements: dict | None = None
     applicable_courses: list | None = None
     teaching_design: dict | None = None
-    evaluation: dict | None = None
     further_reading: list | None = None
     status: str | None = None
 
@@ -339,9 +406,10 @@ def generate_case(req: GenerateCaseRequest, db: Session = Depends(get_db)):
         full_narrative_draft=draft.get("full_narrative_draft"),
         teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
         sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
-        applicable_courses=json.dumps(draft.get("applicable_courses"), ensure_ascii=False),
-        teaching_design=json.dumps(draft.get("teaching_design"), ensure_ascii=False),
-        evaluation=json.dumps(draft.get("evaluation"), ensure_ascii=False),
+        # 适用课程举例/教学设计不在初次生成时产出了，等知识点匹配采纳后才会有内容，
+        # 这里留空（真正的NULL，不是json.dumps(None)的字符串"null"）
+        applicable_courses=None,
+        teaching_design=None,
         further_reading=json.dumps(draft.get("further_reading"), ensure_ascii=False),
         status="待审核",
     )
@@ -925,109 +993,71 @@ def get_knowledge_mappings(case_id: int, db: Session = Depends(get_db)):
 
 @app.put("/api/knowledge_mappings/{mapping_id}")
 def update_mapping(mapping_id: int, req: UpdateMappingRequest, db: Session = Depends(get_db)):
-    """人工修改：采纳/拒绝某条知识点关联，或编辑融入方式建议文字"""
+    """人工修改：采纳/拒绝某条知识点关联，或编辑融入方式建议文字。
+    只要这次修改让案例的"已采纳"知识点集合发生了变化（新采纳一条、或者把已采纳的改成别的
+    状态），就自动重新生成一遍"适用课程举例"/"教学设计"——不用再手动点按钮触发，见
+    knowledge_matching.enrich_case_from_accepted_mappings()。这一步涉及真实LLM调用，
+    接口响应会比单纯改个状态慢一些。"""
     mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == mapping_id).first()
     if not mapping:
         raise HTTPException(404, "关联记录不存在")
+
+    old_status = mapping.status
     if req.status is not None:
         mapping.status = req.status
     if req.suggestion_text is not None:
         mapping.suggestion_text = req.suggestion_text
     db.commit()
     db.refresh(mapping)
-    return mapping.to_dict()
 
+    result = mapping.to_dict()
+    accepted_set_changed = req.status is not None and "已采纳" in (old_status, req.status) and old_status != req.status
+    if accepted_set_changed:
+        case = db.query(Case).filter(Case.id == mapping.case_id).first()
+        if case:
+            try:
+                changes = enrich_case_from_accepted_mappings(db, case)
+                if changes:
+                    db.commit()
+                    db.refresh(case)
+                    log_case_change(db, case.id, "知识点匹配(自动)", changes)
+            except ValueError as e:
+                # 重新生成失败（比如API key没配好）不应该让"采纳/取消采纳"这个状态改动本身失败——
+                # 状态已经落库了，只是适用课程举例/教学设计这次没能自动刷新；用一个附加字段告诉
+                # 前端这个情况，而不是把整个请求判定为失败（返回体形状要跟正常情况一致，前端才能
+                # 正常解析出mapping数据，不能直接raise一个跟mapping.to_dict()完全不同形状的错误体）
+                result["enrich_warning"] = f"状态已更新，但自动生成适用课程举例/教学设计失败：{e}"
 
-def _matching_applicable_course_entries(case: Case, kp: KnowledgePoint) -> list[dict]:
-    """案例"适用课程举例"里，课程名称+适用章节精确匹配这条知识点的条目——用来判断解绑这条
-    知识点关联时，案例里是不是已经写了对应这条知识点的内容，需要一并清理。
-    精确匹配的前提：这些条目是"用已采纳知识点补充适用课程举例"（enrich_case_with_accepted_knowledge）
-    写入的，字段原样来自知识点；如果案例的适用课程是当初生成案例时模型自己写的，可能存在同名但
-    实际无关、匹配不上的情况，这是已知的局限，不在这次处理范围内"""
-    entries = json.loads(case.applicable_courses or "[]")
-    return [
-        e for e in entries
-        if e.get("课程名称") == kp.course_name
-        and (not kp.chapter or e.get("适用章节") == kp.chapter)
-    ]
+    return result
 
 
 @app.delete("/api/knowledge_mappings/{mapping_id}")
-def delete_knowledge_mapping(mapping_id: int, force: bool = False, db: Session = Depends(get_db)):
-    """解绑一条案例↔知识点关联。如果案例的"适用课程举例"里有对应这条知识点的条目，
-    force=False时先返回409说明情况，force=True时连同这些条目一并从案例里删掉"""
+def delete_knowledge_mapping(mapping_id: int, db: Session = Depends(get_db)):
+    """解绑一条案例↔知识点关联。如果这条关联当时是"已采纳"状态，解绑后案例的"已采纳"集合
+    也跟着变了，同样要重新生成一遍"适用课程举例"/"教学设计"（如果解绑后已采纳集合空了，
+    这两个字段会被清空，不会留着解绑前的旧内容）。"""
     mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == mapping_id).first()
     if not mapping:
         raise HTTPException(404, "关联记录不存在")
 
-    case, kp = mapping.case, mapping.knowledge_point
-    matched = _matching_applicable_course_entries(case, kp) if case and kp else []
-
-    if matched and not force:
-        raise HTTPException(
-            409,
-            f"案例{case.case_code}《{case.title or ''}》的「适用课程举例」里有{len(matched)}条提到了"
-            f"这条知识点，解绑后会自动从中删除这些条目，确认要继续吗？",
-        )
-
+    was_accepted = mapping.status == "已采纳"
+    case_id = mapping.case_id
     db.delete(mapping)
-    removed = 0
-    if matched:
-        remaining = [e for e in json.loads(case.applicable_courses or "[]") if e not in matched]
-        old_value = case.applicable_courses
-        case.applicable_courses = json.dumps(remaining, ensure_ascii=False)
-        removed = len(matched)
-        log_case_change(db, case.id, "知识点解绑", {"applicable_courses": {"old": old_value, "new": case.applicable_courses}})
     db.commit()
-    return {"unbound": True, "removed_course_entries": removed}
 
+    result = {"unbound": True}
+    if was_accepted:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if case:
+            try:
+                changes = enrich_case_from_accepted_mappings(db, case)
+                if changes:
+                    db.commit()
+                    log_case_change(db, case.id, "知识点匹配(自动)", changes)
+            except ValueError as e:
+                result["enrich_warning"] = f"已解绑，但自动生成适用课程举例/教学设计失败：{e}"
 
-@app.post("/api/cases/{case_id}/enrich")
-def enrich_case(case_id: int, db: Session = Depends(get_db)):
-    """根据已采纳的知识点关联，调用模型补充案例的「适用课程举例」与「教学设计」"""
-    case = db.query(Case).filter(Case.id == case_id).first()
-    if not case:
-        raise HTTPException(404, "案例不存在")
-
-    accepted = (
-        db.query(CaseKnowledgeMapping)
-        .filter(CaseKnowledgeMapping.case_id == case_id, CaseKnowledgeMapping.status == "已采纳")
-        .all()
-    )
-    if not accepted:
-        raise HTTPException(400, "还没有已采纳的知识点关联，请先在匹配表格里勾选采纳")
-
-    accepted_payload = [
-        {
-            "course_name": m.knowledge_point.course_name,
-            "chapter": m.knowledge_point.chapter,
-            "description": m.knowledge_point.description,
-            "suggestion_text": m.suggestion_text,
-        }
-        for m in accepted
-    ]
-
-    try:
-        enrichment = enrich_case_with_knowledge(case.to_dict(), accepted_payload)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    changes = {}
-    if "applicable_courses" in enrichment:
-        new_value = json.dumps(enrichment["applicable_courses"], ensure_ascii=False)
-        if case.applicable_courses != new_value:
-            changes["applicable_courses"] = {"old": case.applicable_courses, "new": new_value}
-        case.applicable_courses = new_value
-    if "teaching_design" in enrichment:
-        new_value = json.dumps(enrichment["teaching_design"], ensure_ascii=False)
-        if case.teaching_design != new_value:
-            changes["teaching_design"] = {"old": case.teaching_design, "new": new_value}
-        case.teaching_design = new_value
-    db.commit()
-    db.refresh(case)
-    if changes:
-        log_case_change(db, case.id, "AI助手(知识点补充)", changes)
-    return case.to_dict()
+    return result
 
 
 # ---------- 知识图谱 ----------
