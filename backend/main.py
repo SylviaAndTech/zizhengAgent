@@ -701,7 +701,15 @@ def upload_knowledge(
             try:
                 index_knowledge_point(kp)
             except Exception as e:
-                logger.warning(f"知识点(id={kp.id})索引失败，匹配时暂时召回不到它: {e}")
+                # 索引失败不能就这样留着这条MySQL记录——它会正常出现在知识点列表里，
+                # 看起来一切正常，但向量粗筛永远召回不到它，是一种更隐蔽的"看得见、
+                # 用不到"的不一致，跟"MySQL删了、向量库没删干净"的孤儿向量是同一类问题
+                # 反过来的版本。这里直接把这条MySQL记录也回滚掉，当成这条知识点没导入
+                # 成功处理，让用户能看到明确的失败提示、之后可以重新上传
+                db.delete(kp)
+                db.commit()
+                errors.append(f"{filename}：知识点「{p['description'][:20]}...」建立向量索引失败，已跳过：{e}")
+                continue
             created.append({
                 "id": kp.id, "course_name": kp.course_name,
                 "chapter": kp.chapter, "description": kp.description,
@@ -868,6 +876,21 @@ def delete_knowledge_by_course(course_name: str, force: bool = False, db: Sessio
     if blocking_detail and not force:
         raise HTTPException(409, f"这门课程下有知识点已经被案例引用，无法删除：{blocking_detail}")
 
+    # 先删向量库、全部成功了再删MySQL，理由同delete_knowledge_point：避免"MySQL删了、
+    # 向量库没删干净"这种不报错的孤儿向量
+    failed_ids = []
+    for point_id in point_ids:
+        try:
+            remove_knowledge_point_from_index(point_id)
+        except Exception as e:
+            failed_ids.append(point_id)
+            logger.warning(f"知识点(id={point_id})从向量库删除失败: {e}")
+    if failed_ids:
+        raise HTTPException(
+            500,
+            f"有{len(failed_ids)}条知识点从向量库删除失败，为避免留下孤儿向量，本次删除已取消，可以重试：涉及id {failed_ids}",
+        )
+
     removed_mappings = 0
     if force:
         removed_mappings = (
@@ -878,11 +901,6 @@ def delete_knowledge_by_course(course_name: str, force: bool = False, db: Sessio
 
     db.query(KnowledgePoint).filter(KnowledgePoint.id.in_(point_ids)).delete(synchronize_session=False)
     db.commit()
-    for point_id in point_ids:
-        try:
-            remove_knowledge_point_from_index(point_id)
-        except Exception as e:
-            logger.warning(f"知识点(id={point_id})从向量库删除失败，语义检索可能还会召回它: {e}")
     return {"deleted": True, "count": len(point_ids), "removed_mappings": removed_mappings}
 
 
@@ -924,6 +942,15 @@ def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Dep
     if blocking_detail and not force:
         raise HTTPException(409, f"这条知识点已经被案例引用，无法删除：{blocking_detail}")
 
+    # 先删向量库、成功了再删MySQL：万一向量库这一步失败，整个请求直接报错、MySQL记录
+    # 原样保留，用户能看到失败提示并重试；如果反过来先删MySQL再删向量库，向量库这步
+    # 一旦失败就会留下"MySQL已经没有这条记录、向量库里还留着"的孤儿向量——不报错、
+    # 不易察觉，之前排查向量粗筛问题时就真的挖出过82条这样的历史孤儿
+    try:
+        remove_knowledge_point_from_index(point_id)
+    except Exception as e:
+        raise HTTPException(500, f"知识点(id={point_id})从向量库删除失败，为避免留下孤儿向量，本次删除已取消，可以重试：{e}")
+
     removed_mappings = 0
     if force:
         removed_mappings = (
@@ -934,10 +961,6 @@ def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Dep
 
     db.delete(kp)
     db.commit()
-    try:
-        remove_knowledge_point_from_index(point_id)
-    except Exception as e:
-        logger.warning(f"知识点(id={point_id})从向量库删除失败，语义检索可能还会召回它: {e}")
     return {"deleted": True, "removed_mappings": removed_mappings}
 
 

@@ -28,7 +28,10 @@ CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8001"))
 COLLECTION_NAME = "knowledge_point_vectors"
 
 MIN_KP_CHARS = 6
-MAX_KP_CHARS = 200
+# 扫描件走的syllabus_vision_ocr现在整格转录"教学内容"（含编号、重点/难点），不再拆成
+# 单条短语，同一个知识单元的描述可能有小几百字；这个上限是"过滤明显异常的超长内容"用的
+# 兜底，不是"内容应该多短"的期望值，给足够宽裕的余量，避免正常的完整格子内容被误伤过滤掉
+MAX_KP_CHARS = 800
 MAX_QUERY_CHARS = 2000  # DashScope embedding接口对单条文本长度有限制，案例正文可能很长，检索前要截断
 
 COARSE_TOP_K = 15       # 向量粗筛阶段保留的候选数，交给LLM复核
