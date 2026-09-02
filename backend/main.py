@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from db import (
     init_db, get_db, SessionLocal, RawMaterial, Case, CaseMaterial, DIMENSIONS,
     KnowledgePoint, CaseKnowledgeMapping, ChatSession, CaseAuditLog, User,
+    allocate_case_version_code,
 )
 from auth import (
     AUTH_ENABLED, DEFAULT_ADMIN_USERNAME, verify_password,
@@ -36,6 +37,8 @@ from knowledge_matching import (
 from chat_agent import stream_chat
 from audit import log_case_change
 from doc_writer import write_case_section, set_default_font
+from mermaid_tree import build_applicable_courses_mermaid
+from mermaid_render import render_mermaid_batch
 from knowledge_graph import build_graph, render_graph_png, render_graph_html
 from book_export import build_book_docx
 from material_index import index_material
@@ -399,7 +402,7 @@ def generate_case(req: GenerateCaseRequest, db: Session = Depends(get_db)):
         raise HTTPException(500, f"生成失败: {str(e)}")
 
     case = Case(
-        case_code=req.case_code,
+        case_code=allocate_case_version_code(db, req.case_code),
         dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
         title=draft.get("title"),
         full_narrative=draft.get("full_narrative"),
@@ -530,12 +533,15 @@ def export_cases(req: ExportCasesRequest, db: Session = Depends(get_db)):
     if not cases:
         raise HTTPException(400, "没有找到要导出的案例")
 
+    case_dicts = [c.to_dict() for c in cases]
+    tree_pngs = render_mermaid_batch([build_applicable_courses_mermaid(cd) for cd in case_dicts])
+
     doc = docx.Document()
     set_default_font(doc)
     doc.add_heading("思政案例集（导出）", level=0)
 
-    for c in cases:
-        write_case_section(doc, c.to_dict(), heading_level=1)
+    for cd, png in zip(case_dicts, tree_pngs):
+        write_case_section(doc, cd, heading_level=1, course_tree_png=png)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -967,7 +973,7 @@ def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Dep
 @app.post("/api/cases/{case_id}/match_knowledge")
 def match_knowledge(case_id: int, db: Session = Depends(get_db)):
     """
-    对已审核/草稿案例，跑一遍与知识点库的匹配：向量粗筛+Qwen复核精排，生成候选关联建议
+    对已审核/草稿案例，跑一遍与知识点库的匹配：向量+关键词混合粗筛 + Qwen复核精排，生成候选关联建议
     """
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
@@ -980,6 +986,10 @@ def match_knowledge(case_id: int, db: Session = Depends(get_db)):
         matches = match_case_to_knowledge(db, case)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    # match_case_to_knowledge内部可能顺带生成/刷新了case.topic_keywords（向量检索查询文本
+    # 的缓存，懒生成+按正文内容哈希失效），这里落库；不是用户可见的内容变更，不写审计日志
+    db.commit()
 
     # 清空旧的"推荐"记录避免重复堆积；已人工采纳/拒绝的决定予以保留
     db.query(CaseKnowledgeMapping).filter(

@@ -17,7 +17,10 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
-from db import SessionLocal, RawMaterial, Case, CaseMaterial, CaseKnowledgeMapping, DIMENSIONS
+from db import (
+    SessionLocal, RawMaterial, Case, CaseMaterial, CaseKnowledgeMapping, DIMENSIONS,
+    allocate_case_version_code,
+)
 from generate_case import generate_case_draft as _generate_case_draft_impl
 from knowledge_matching import enrich_case_from_accepted_mappings as _enrich_case_from_accepted_mappings
 from material_index import search_materials as _search_materials_impl
@@ -39,7 +42,9 @@ SYSTEM_PROMPT = f"""你是"思政案例生成工作台"的AI助手，帮助用�
 可用的思政维度：{", ".join(DIMENSIONS)}
 """
 
-# 案例生成这个工具耗时8-9分钟，用这个队列把"当前跑到第几步"从工具执行的线程实时传到
+# 案例生成这个工具耗时8-9分钟起步（正文写作引入了writer/judge/reviser评审循环，评审不通过
+# 时还会再多跑1轮修订+评审，实际耗时会明显超过这个下限，具体取决于CASE_NARRATIVE_MAX_ITERATIONS），
+# 用这个队列把"当前跑到第几步"从工具执行的线程实时传到
 # stream_chat()里跑SSE的那个消费循环，好在聊天界面上显示进度。用ContextVar而不是模块级
 # 全局变量，是因为如果两个用户同时在各自的聊天里触发生成，全局变量会导致进度串台；
 # ContextVar在stream_chat()新起的后台线程里各自独立设置，互不干扰。
@@ -111,7 +116,11 @@ def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
     """用指定的素材ID列表，调用模型生成一份新的七段式案例草稿并存入数据库。
     不需要指定思政维度——每个案例都要求对五个官方思政维度（政治认同/家国情怀/文化素养/
     宪法法治意识/道德修养）逐一给出摘录表述+解释，案例所属的书稿章节分类（也是这五个维度之一）
-    由模型结合案例内容自主判断给出。"""
+    由模型结合案例内容自主判断给出。
+    如果这个case_code在案例库里已经生成过（不管用的是不是同一批素材），不会覆盖已有案例，
+    而是自动落库成 case_code-1、case_code-2……这样的新版本编号，方便同一个编号反复试生成、
+    审核时再挑一个采纳；返回结果里的case_code字段会是实际落库用的这个版本化编号，回复用户时
+    要用这个编号，不要说成用户原来给的那个编号。"""
     db = SessionLocal()
     try:
         materials = db.query(RawMaterial).filter(RawMaterial.id.in_(material_ids)).all()
@@ -128,7 +137,7 @@ def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
         case = Case(
-            case_code=case_code,
+            case_code=allocate_case_version_code(db, case_code),
             dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
             title=draft.get("title"),
             full_narrative=draft.get("full_narrative"),

@@ -5,6 +5,11 @@
 <title>思政案例生成工作台 - 原型</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "base" });
+  window.mermaid = mermaid;
+</script>
 <style>
   :root {
     --primary: #b3282d;
@@ -151,6 +156,8 @@
   .section-title { font-weight: 600; font-size: 14px; margin: 16px 0 6px; display: flex; align-items: center; gap: 8px; }
   .section-title .badge { background: #f0e8de; color: #8a6a3a; font-size: 11px; padding: 2px 8px; border-radius: 4px; }
   .narrative-box { white-space: pre-wrap; line-height: 1.9; font-size: 14px; background: #fbfaf8; border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .mermaid-tree { overflow-x: auto; background: #fbfaf8; border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .mermaid-tree svg { max-width: none; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
   th, td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
   th { background: #f0ece7; }
@@ -412,14 +419,14 @@
     <div class="inline-row">
       <div>
         <label>选择案例</label>
-        <select id="matchCaseSelect"></select>
+        <select id="matchCaseSelect" onchange="loadCaseMappings(this.value)"></select>
       </div>
       <div style="flex:0;">
         <button id="runMatchBtn" onclick="runMatch()">🔍 运行匹配</button>
       </div>
     </div>
     <div id="matchLoading" class="loading" style="display:none;">⏳ 正在匹配中，请稍候...</div>
-    <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div></div>
+    <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">该案例还没有匹配记录，点击上方"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div></div>
     <button onclick="enrichCurrentCase()" style="background:var(--success)">✨ 用已采纳的知识点，补充该案例的「适用课程举例」与「教学设计」（在AI助手对话里进行）</button>
   </div>
 </div>
@@ -1130,6 +1137,7 @@ async function openCaseDetail(id) {
   document.getElementById("previewBody").innerHTML = editBtnHtml + renderCaseDetailHTML(c) +
     '<div class="section-title">📝 修改记录</div><div class="loading">加载中...</div>';
   document.getElementById("previewModal").classList.add("active");
+  renderCourseTree(c);
 
   loadCaseMaterialsForCitations(id); // 不等它，加载完悬浮预览自然就能用了，不阻塞详情本身的展示
 
@@ -1137,6 +1145,7 @@ async function openCaseDetail(id) {
     const res = await apiFetch(`${API_BASE}/api/cases/${id}/audit_log`);
     const logs = await res.json();
     document.getElementById("previewBody").innerHTML = editBtnHtml + renderCaseDetailHTML(c) + renderAuditLogHTML(logs);
+    renderCourseTree(c);
   } catch (e) {
     // 修改记录加载失败不影响案例详情本身的展示，静默即可
   }
@@ -1304,10 +1313,16 @@ function renderCaseDetailHTML(c) {
     ${!courses || courses.length === 0 ? `
     <div class="empty-hint">尚未生成——请先在「知识点匹配」页面为这个案例匹配并采纳知识点，采纳后会自动生成</div>
     ` : `
-    <table>
-      <tr><th>课程名称</th><th>适用章节</th><th>融入方式建议</th></tr>
-      ${courses.map(r => `<tr><td>${escHtml(r["课程名称"] || "")}</td><td>${escHtml(r["适用章节"] || "")}</td><td>${escHtml(r["融入方式建议"] || "")}</td></tr>`).join("")}
-    </table>
+    <div class="mermaid-tree" id="courseTree_${c.id}"><div class="loading">树状图渲染中…</div></div>
+    <div style="margin-top:8px;">
+      <span class="suggestion-preview" id="courseTableToggle_${c.id}" style="display:inline-block;color:var(--primary);" onclick="toggleCourseTable(${c.id})">
+        📊 查看表格明细（含融入方式建议） ▼
+      </span>
+      <table style="display:none;margin-top:6px;" id="courseTable_${c.id}">
+        <tr><th>课程名称</th><th>适用章节</th><th>融入方式建议</th></tr>
+        ${courses.map(r => `<tr><td>${escHtml(r["课程名称"] || "")}</td><td>${escHtml(r["适用章节"] || "")}</td><td>${escHtml(r["融入方式建议"] || "")}</td></tr>`).join("")}
+      </table>
+    </div>
     `}
 
     <div class="section-title">⑤ 教学设计</div>
@@ -1329,6 +1344,99 @@ function renderCaseDetailHTML(c) {
   `;
 }
 
+function toggleCourseTable(caseId) {
+  const box = document.getElementById(`courseTable_${caseId}`);
+  const toggle = document.getElementById(`courseTableToggle_${caseId}`);
+  if (!box) return;
+  const showing = box.style.display !== "none";
+  box.style.display = showing ? "none" : "table";
+  if (toggle) toggle.innerHTML = `📊 查看表格明细（含融入方式建议） ${showing ? "▼" : "▲"}`;
+}
+
+// mermaid节点标签只能用双引号包裹的文本，标签内不能再出现裸的双引号/方括号，否则会破坏
+// 语法结构；换行统一转成<br/>（mermaid标签支持这个标签）。Mermaid不会自动给节点内的文字
+// 换行——文字多长，节点就撑多宽，所以超过wrapLen字符数时手动按字符数插入<br/>分行，让
+// 文字分成多行显示在框内；之前是直接截断加"…"丢弃后半段内容，导致知识点简述这类偏长的
+// 技术描述看不全，改成换行后能保证全部文字都显示出来。
+// 跟backend/mermaid_tree.py的mermaid_escape()是同一份逻辑的两处实现（导出Word用Playwright
+// 无头浏览器渲染这张图时要用Python重新生成一遍定义字符串），两边的换行宽度/转义规则必须
+// 保持一致，改一处要记得同步改另一处，否则"页面上看到的图"和"导出Word里嵌的图"会不一样。
+function mermaidEsc(s, wrapLen) {
+  let t = String(s || "").trim().replace(/["\[\]]/g, "").replace(/\s*\n+\s*/g, "<br/>");
+  if (wrapLen) {
+    t = t.split("<br/>").map(seg => {
+      const chars = Array.from(seg); // 用Array.from而不是按length切，避免把代理对/组合字符切断
+      if (chars.length <= wrapLen) return seg;
+      const lines = [];
+      for (let i = 0; i < chars.length; i += wrapLen) lines.push(chars.slice(i, i + wrapLen).join(""));
+      return lines.join("<br/>");
+    }).join("<br/>");
+  }
+  return t;
+}
+
+// 案例详情里"④ 适用课程举例"的树状图：第一层案例编号+名字，第二层课程名字，第三层
+// 章节，第四层知识点简述（同一课程/章节下可能有多条已采纳的知识点，各自一个叶子节点）。
+// applicable_courses每一行对应一条"已采纳的知识点关联"生成的结果，见knowledge_matching.py
+// enrich_case_from_accepted_mappings()——这里只是把同一课程/章节的行分组画成树，不改数据。
+function buildApplicableCoursesMermaid(c) {
+  const courses = c.applicable_courses;
+  if (!courses || courses.length === 0) return null;
+
+  const lines = [
+    "graph LR",
+    "classDef caseNode fill:#4F46E5,stroke:#3730A3,stroke-width:2px,color:#FFFFFF,rx:8px,ry:8px;",
+    "classDef courseNode fill:#0EA5E9,stroke:#0369A1,stroke-width:2px,color:#FFFFFF,rx:6px,ry:6px;",
+    "classDef chapterNode fill:#10B981,stroke:#047857,stroke-width:2px,color:#FFFFFF,rx:6px,ry:6px;",
+    "classDef kpNode fill:#F3F4F6,stroke:#D1D5DB,stroke-width:1.5px,color:#1F2937,rx:6px,ry:6px;",
+    `CASE["案例 ${mermaidEsc(c.case_code)}<br/>${mermaidEsc(c.title, 16)}"]:::caseNode`,
+  ];
+
+  const courseMap = new Map(); // 课程名 -> Map(章节名 -> [知识点简述, ...])
+  courses.forEach(row => {
+    const courseName = (row["课程名称"] || "").trim() || "(未命名课程)";
+    const chapterName = (row["适用章节"] || "").trim() || "(未标注章节)";
+    const kp = (row["知识点简述"] || "").trim();
+    if (!courseMap.has(courseName)) courseMap.set(courseName, new Map());
+    const chapterMap = courseMap.get(courseName);
+    if (!chapterMap.has(chapterName)) chapterMap.set(chapterName, []);
+    if (kp) chapterMap.get(chapterName).push(kp);
+  });
+
+  let ci = 0;
+  for (const [courseName, chapterMap] of courseMap) {
+    ci++;
+    const cid = `C${ci}`;
+    lines.push(`CASE --> ${cid}["课程：${mermaidEsc(courseName, 16)}"]:::courseNode`);
+    let chi = 0;
+    for (const [chapterName, kps] of chapterMap) {
+      chi++;
+      const chid = `${cid}_CH${chi}`;
+      lines.push(`${cid} --> ${chid}["${mermaidEsc(chapterName, 16)}"]:::chapterNode`);
+      kps.forEach((kp, ki) => {
+        const kpid = `${chid}_KP${ki + 1}`;
+        lines.push(`${chid} --> ${kpid}["知识点：${mermaidEsc(kp, 16)}"]:::kpNode`);
+      });
+    }
+  }
+  return lines.join("\n");
+}
+
+let _mermaidRenderSeq = 0;
+async function renderCourseTree(c) {
+  const container = document.getElementById(`courseTree_${c.id}`);
+  if (!container) return;
+  const def = buildApplicableCoursesMermaid(c);
+  if (!def) return;
+  try {
+    _mermaidRenderSeq++;
+    const { svg } = await window.mermaid.render(`courseTreeSvg_${c.id}_${_mermaidRenderSeq}`, def);
+    container.innerHTML = svg;
+  } catch (e) {
+    container.innerHTML = '<div class="empty-hint">树状图渲染失败</div>';
+  }
+}
+
 /* ================= 案例库：直接编辑案例内容 ================= */
 let editingCaseId = null;
 let editCourseRows = [];
@@ -1340,6 +1448,7 @@ function openCaseEdit(id) {
   editingCaseId = id;
   editCourseRows = (c.applicable_courses || []).map(r => ({
     name: r["课程名称"] || "", chapter: r["适用章节"] || "", suggestion: r["融入方式建议"] || "",
+    kp: r["知识点简述"] || "", // 不在编辑表格里展示这一列（树状图第四层叶子来源），原样透传保存，避免手工编辑时丢失
   }));
   editReadingRows = (c.further_reading || []).map(r => ({
     type: r.type || "", title: r.title || "", url: r.url || "",
@@ -1415,16 +1524,17 @@ function renderCourseRowsHTML() {
 }
 
 function syncCourseRowsFromDOM() {
-  editCourseRows = editCourseRows.map((_, i) => ({
+  editCourseRows = editCourseRows.map((r, i) => ({
     name: document.getElementById(`course_name_${i}`)?.value || "",
     chapter: document.getElementById(`course_chapter_${i}`)?.value || "",
     suggestion: document.getElementById(`course_suggestion_${i}`)?.value || "",
+    kp: r.kp || "", // 没有对应输入框，原样保留
   }));
 }
 
 function addCourseRow() {
   syncCourseRowsFromDOM();
-  editCourseRows.push({ name: "", chapter: "", suggestion: "" });
+  editCourseRows.push({ name: "", chapter: "", suggestion: "", kp: "" });
   document.getElementById("editCoursesTable").innerHTML = renderCourseRowsHTML();
 }
 
@@ -1494,7 +1604,7 @@ async function saveCaseEdit() {
     },
     applicable_courses: editCourseRows
       .filter(r => r.name || r.chapter || r.suggestion)
-      .map(r => ({ "课程名称": r.name, "适用章节": r.chapter, "融入方式建议": r.suggestion })),
+      .map(r => ({ "课程名称": r.name, "适用章节": r.chapter, "融入方式建议": r.suggestion, "知识点简述": r.kp || "" })),
     teaching_design: {
       "课前": document.getElementById("edit_td_pre").value,
       "课中": document.getElementById("edit_td_during").value,
@@ -1915,6 +2025,25 @@ function populateMatchCaseSelect() {
   const prevValue = sel.value;
   sel.innerHTML = casesCache.map(c => `<option value="${c.id}">案例${escHtml(c.case_code)}：${escHtml(c.title || "(无标题)")} [${c.status}]</option>`).join("");
   if (prevValue) sel.value = prevValue;
+  loadCaseMappings(sel.value);  // 案例列表刷新后，不管是保留了之前选中项还是默认选中第一个，
+                                // 都要把对应案例已有的匹配记录（含已采纳/已拒绝）加载出来展示
+}
+
+// 加载并展示某个案例已有的全部匹配记录（推荐/已采纳/已拒绝），不触发重新计算——
+// 用于"切换选中的案例"和"打开知识点匹配标签页"两个场景，让人工之前做过的判断
+// 不用重新点一次"运行匹配"就能看到。跟runMatch()是两件事：这个只读取，不计算。
+async function loadCaseMappings(caseId) {
+  currentMatchCaseId = caseId ? parseInt(caseId) : null;
+  if (!caseId) { currentMappings = []; renderMappingTable(); return; }
+  try {
+    const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/knowledge_mappings`);
+    if (!res.ok) throw new Error("加载失败");
+    currentMappings = await res.json();  // 这个GET端点直接返回数组，跟match_knowledge的{mappings:[...]}不一样
+  } catch (e) {
+    toast("加载已有匹配记录出错: " + e.message);
+    currentMappings = [];
+  }
+  renderMappingTable();
 }
 
 async function runMatch() {
@@ -1929,9 +2058,11 @@ async function runMatch() {
     const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/match_knowledge`, { method: "POST" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "匹配失败");
-    currentMappings = data.mappings;
-    renderMappingTable();
-    toast(`匹配完成，共 ${data.mappings.length} 条候选`);
+    toast(`匹配完成，新增 ${data.mappings.length} 条候选`);
+    // 重算只会清空未处理的"推荐"记录、保留已采纳/已拒绝（后端逻辑），这里重新拉取这个
+    // 案例完整的匹配记录来渲染，而不是只用本次响应里新建的这一批，避免把已采纳/已拒绝的
+    // 历史判断从表格里漏掉
+    await loadCaseMappings(caseId);
   } catch (e) {
     toast("匹配出错: " + e.message);
   } finally {
@@ -1943,7 +2074,7 @@ async function runMatch() {
 function renderMappingTable() {
   const el = document.getElementById("mappingTable");
   if (!currentMappings || currentMappings.length === 0) {
-    el.innerHTML = '<div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div>';
+    el.innerHTML = '<div class="empty-hint">该案例还没有匹配记录，点击上方"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div>';
     return;
   }
   el.innerHTML = `<table>

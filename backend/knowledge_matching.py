@@ -1,17 +1,28 @@
 """
 知识点抽取（启发式，来自上传的课程教学大纲文档）
-与 案例↔知识点 匹配：LlamaIndex(ChromaDB)向量粗筛(ANN检索) + Qwen LLM复核精排（结合教学语境重新打分、给融入建议）
+与 案例↔知识点 匹配：
+  向量粗筛(ANN检索) + 关键词粗筛(BM25) 两路RRF融合 + Qwen LLM复核精排（结合教学语境重新打分、给融入建议）
+
+两路粗筛为什么都要：案例正文是叙事体（人物/事件/引语），知识点描述是教学大纲里的技术条目，
+两种文本语域差异很大，纯向量相似度实测下来区分度很弱（真实案例测过：语义完全不相关的候选
+跟真正相关的候选，cosine分数常常只差0.02~0.05）。加一路BM25关键词检索能兜住"案例正文里
+直接出现了知识点描述里的原词（比如都提到'云计算'），但整体语义分数没能体现出来"这类情况，
+两路各有侧重，用RRF（只看排名不看具体分数值，两路分数量纲完全不同没法直接比）融合。
 """
+import hashlib
 import json
+import logging
 import os
 import re
 
 import fitz  # PyMuPDF
+import jieba
 import openai
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import TextNode
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from rank_bm25 import BM25Okapi
 
 from llama_index_setup import configure_llama_index
 from ocr_utils import doc_is_scanned, native_page_lines, ocr_page_lines
@@ -22,6 +33,8 @@ from syllabus_table_ocr import extract_units_and_points
 from syllabus_vision_ocr import extract_units_and_points as extract_units_and_points_vision
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 CHROMA_HOST = os.environ.get("CHROMA_HOST", "127.0.0.1")
 CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8001"))
@@ -34,8 +47,9 @@ MIN_KP_CHARS = 6
 MAX_KP_CHARS = 800
 MAX_QUERY_CHARS = 2000  # DashScope embedding接口对单条文本长度有限制，案例正文可能很长，检索前要截断
 
-COARSE_TOP_K = 15       # 向量粗筛阶段保留的候选数，交给LLM复核
+COARSE_TOP_K = 15       # 向量/关键词粗筛阶段各自保留的候选数，融合后再交给LLM复核
 FINE_TOP_K = 8          # 最终展示给用户的候选数
+RRF_K = 60              # RRF融合常数，业界常用默认值，不是需要为这个项目单独调的参数
 
 # 大纲标题里常见的"课程名+大纲"套话，用于从标题里剥离出干净的课程名
 _COURSE_SUFFIX_RE = re.compile(r"(课程)?(教学)?大纲.*$")
@@ -214,19 +228,30 @@ def _get_index() -> VectorStoreIndex:
     return _index
 
 
+def _kp_embedding_text(course_name: str, chapter: str | None, description: str) -> str:
+    """知识点用于embedding/BM25检索的文本——course_name+chapter+description拼起来，
+    比单独用description本身多一点语境。注意：这个拼接只影响"喂给检索的文本"，不影响
+    description字段本身的存储/展示——description必须保持逐字忠实（下游"适用课程举例"/
+    "教学设计"生成都依赖这一点），不能为了检索效果反过来污染这个字段"""
+    return f"{course_name} {chapter or ''} {description}".strip()
+
+
 def index_knowledge_point(kp) -> None:
-    """把一条知识点的描述向量化存入知识点向量库。kp: KnowledgePoint对象。
-    每条知识点本身就是抽取阶段已经拆好的一条原子描述，不用再切块，一条对应一个向量"""
+    """把一条知识点存入向量库（course_name+chapter+description拼接后embedding）。
+    kp: KnowledgePoint对象。每条知识点本身就是抽取阶段已经拆好的一条原子描述，
+    不用再切块，一条对应一个向量"""
     node = TextNode(
         id_=str(kp.id),
-        text=kp.description,
+        text=_kp_embedding_text(kp.course_name, kp.chapter, kp.description),
         metadata={"course_name": kp.course_name, "chapter": kp.chapter or ""},
     )
     _get_index().insert_nodes([node])
+    _invalidate_bm25_cache()
 
 
 def remove_knowledge_point_from_index(kp_id: int) -> None:
     _get_index().vector_store.delete_nodes([str(kp_id)])
+    _invalidate_bm25_cache()
 
 
 def reindex_knowledge_point(kp) -> None:
@@ -237,38 +262,129 @@ def reindex_knowledge_point(kp) -> None:
     index_knowledge_point(kp)
 
 
+_bm25_cache: tuple | None = None  # (BM25Okapi实例或None, [kp_id,...])，None表示需要重建
+
+
+def _invalidate_bm25_cache() -> None:
+    """知识点库有变更（新增/删除/编辑）时调用，逼下次匹配请求重新从MySQL建一次BM25索引。
+    不在每次匹配请求里都重新对全量语料分词——语料涨到几万条时，现场分词会成为明显的
+    延迟来源；缓存把这块开销从"每次匹配"移到"每次知识点库变更"（后者频率低得多）"""
+    global _bm25_cache
+    _bm25_cache = None
+
+
+def _tokenize_for_bm25(text: str) -> list[str]:
+    return [t for t in jieba.cut_for_search(text) if t.strip()]
+
+
+def _get_bm25_index(db) -> tuple:
+    global _bm25_cache
+    if _bm25_cache is not None:
+        return _bm25_cache
+
+    from db import KnowledgePoint
+    points = db.query(KnowledgePoint).all()
+    kp_ids = [kp.id for kp in points]
+    corpus = [
+        _tokenize_for_bm25(_kp_embedding_text(kp.course_name, kp.chapter, kp.description))
+        for kp in points
+    ]
+    bm25 = BM25Okapi(corpus) if corpus else None
+    _bm25_cache = (bm25, kp_ids)
+    return _bm25_cache
+
+
+def _rrf_fuse(*ranked_id_lists: list[int], k: int = RRF_K) -> list[int]:
+    """Reciprocal Rank Fusion：只看每个候选在各路检索结果里的排名，不看具体分数值——
+    向量cosine分数和BM25分数完全不是一个量纲，直接加权求和没有意义，RRF不需要为
+    分数做归一化/调参，更稳健。返回按融合分数降序排列的候选id列表"""
+    scores: dict[int, float] = {}
+    for ranked_ids in ranked_id_lists:
+        for rank, kp_id in enumerate(ranked_ids):
+            scores[kp_id] = scores.get(kp_id, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores, key=lambda i: scores[i], reverse=True)
+
+
+def _ensure_topic_keywords(case) -> str:
+    """案例↔知识点向量检索的查询文本用"主题关键词"而不是完整正文（叙事体语域跟知识点
+    技术条目差异太大，见模块顶部说明）。懒生成+按title/full_narrative内容哈希缓存：
+    只有正文实际变了才重新调用LLM提炼一次，不是每次匹配请求都调用。
+    这个函数只改case对象的字段值（topic_keywords/topic_keywords_source_hash），不落库，
+    commit交给调用方——跟enrich_case_from_accepted_mappings是同一个模式。
+    LLM调用失败时不缓存失败状态（不写source_hash，下次匹配还会重试），这次退化用
+    "标题+正文"本身当查询文本，不让匹配功能因为这一步失败就彻底不可用"""
+    source = f"{case.title or ''}\n{case.full_narrative or ''}"
+    current_hash = hashlib.md5(source.encode("utf-8")).hexdigest()
+
+    if case.topic_keywords and case.topic_keywords_source_hash == current_hash:
+        return case.topic_keywords
+
+    from generate_case import extract_topic_keywords
+    try:
+        keywords = extract_topic_keywords(case.title or "", case.full_narrative or "")
+    except Exception as e:
+        logger.warning(f"案例(id={case.id})提炼主题关键词失败，本次匹配退化用原始正文做向量检索: {e}")
+        return source
+
+    case.topic_keywords = keywords
+    case.topic_keywords_source_hash = current_hash
+    return keywords
+
+
 def match_case_to_knowledge(db, case) -> list[dict]:
     """
-    两阶段匹配：
-    1. 向量粗筛：把案例正文丢给LlamaIndex(ChromaDB)做ANN检索，从知识点向量库里召回候选集
-    2. LLM复核精排：Qwen结合教学语境重新打分、给出具体的融入方式建议（比纯向量分数更懂"是否真的适合当案例引入"）
+    三阶段匹配：
+    1. 向量粗筛：把案例的"主题关键词"（不是完整正文，见_ensure_topic_keywords）丢给
+       LlamaIndex(ChromaDB)做ANN检索，从知识点向量库里召回候选集
+    2. 关键词粗筛：把案例正文丢给BM25，召回字面/术语重合的候选集
+    3. 两路用RRF融合，交给Qwen LLM复核精排：结合教学语境重新打分、给出具体的融入方式
+       建议（比粗筛信号更懂"是否真的适合当案例引入"）
     返回 [{"knowledge_point": KnowledgePoint对象, "relevance_score": 0-100, "suggestion_text": str}, ...]，按分数降序
     """
     require_api_key()
 
-    case_text = f"{case.title or ''}\n{case.full_narrative or ''}".strip()
-    if not case_text:
+    if not (case.title or "").strip() and not (case.full_narrative or "").strip():
         raise ValueError("案例还没有正文内容，无法匹配知识点")
 
+    query_keywords = _ensure_topic_keywords(case)
+    case_full_text = f"{case.title or ''}\n{case.full_narrative or ''}".strip()
+
     retriever = _get_index().as_retriever(similarity_top_k=COARSE_TOP_K)
-    hits = [h for h in retriever.retrieve(case_text[:MAX_QUERY_CHARS]) if (h.score or 0) > 0]
-    if not hits:
+    vector_hits = [h for h in retriever.retrieve(query_keywords[:MAX_QUERY_CHARS]) if (h.score or 0) > 0]
+    vector_ranked_ids = [int(h.node.id_) for h in vector_hits]
+
+    bm25, bm25_kp_ids = _get_bm25_index(db)
+    keyword_ranked_ids = []
+    if bm25 is not None and bm25_kp_ids:
+        bm25_scores = bm25.get_scores(_tokenize_for_bm25(case_full_text[:MAX_QUERY_CHARS]))
+        ranked_pairs = sorted(zip(bm25_kp_ids, bm25_scores), key=lambda p: p[1], reverse=True)
+        keyword_ranked_ids = [kp_id for kp_id, score in ranked_pairs[:COARSE_TOP_K] if score > 0]
+
+    fused_ids = _rrf_fuse(vector_ranked_ids, keyword_ranked_ids)[:COARSE_TOP_K]
+    if not fused_ids:
         return []
 
     from db import KnowledgePoint
-    kp_ids = [int(h.node.id_) for h in hits]
-    kp_by_id = {kp.id: kp for kp in db.query(KnowledgePoint).filter(KnowledgePoint.id.in_(kp_ids)).all()}
+    kp_by_id = {kp.id: kp for kp in db.query(KnowledgePoint).filter(KnowledgePoint.id.in_(fused_ids)).all()}
+
+    vector_id_set = set(vector_ranked_ids)
+    keyword_id_set = set(keyword_ranked_ids)
 
     candidates = []
     candidate_payload = []
-    for h in hits:
-        kp = kp_by_id.get(int(h.node.id_))
+    for kp_id in fused_ids:
+        kp = kp_by_id.get(kp_id)
         if not kp:
             continue
+        matched_by = []
+        if kp_id in vector_id_set:
+            matched_by.append("向量语义")
+        if kp_id in keyword_id_set:
+            matched_by.append("关键词")
         candidates.append(kp)
         candidate_payload.append({
             "id": kp.id, "course_name": kp.course_name, "chapter": kp.chapter,
-            "description": kp.description, "coarse_score": round((h.score or 0) * 100),
+            "description": kp.description, "matched_by": matched_by,
         })
     if not candidates:
         return []
@@ -358,6 +474,15 @@ def enrich_case_from_accepted_mappings(db, case) -> dict:
 
     from generate_case import enrich_case_with_knowledge
     enrichment = enrich_case_with_knowledge(case.to_dict(), accepted_payload)
+
+    courses = enrichment.get("applicable_courses")
+    if isinstance(courses, list) and len(courses) == len(accepted_payload):
+        # 模型按提示词要求，为每条已采纳知识点按顺序各输出一条适用课程举例；这里直接按位置
+        # 把知识点描述原文逐字复原回对应行（供前端画树状图用的第四层叶子节点），不依赖模型
+        # 自己把description重新抄一遍——那样容易复述走样，见_kp_embedding_text()的注释
+        for row, mapping in zip(courses, accepted_payload):
+            if isinstance(row, dict):
+                row["知识点简述"] = mapping["description"]
 
     for field in ("applicable_courses", "teaching_design"):
         if field not in enrichment:

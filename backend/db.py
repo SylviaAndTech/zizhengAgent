@@ -8,10 +8,11 @@ import datetime
 import json
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, text
+    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, text, or_
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
@@ -69,10 +70,17 @@ class Case(Base):
     full_narrative_draft = Column(Text)    # 去AI味改写之前的正文初稿，跟full_narrative一起给用户对照查看
     teaching_objectives = Column(Text)     # 案例教学目标 {"知识":..,"能力":..,"素养":..}
     sizheng_elements = Column(Text)        # 课程思政元素，按五维度摘录 {dimension: text}
-    applicable_courses = Column(Text)      # 适用课程举例 [{课程名称,适用章节,融入方式建议}]
+    applicable_courses = Column(Text)      # 适用课程举例 [{课程名称,适用章节,融入方式建议,知识点简述}]
     teaching_design = Column(Text)         # 教学设计 {"课前":..,"课中":..,"课后":..}
     evaluation = Column(Text)              # 课程评价与成效 {"达成度":..,"参与度":..,"教学反思":..}
     further_reading = Column(Text)         # 延伸阅读 [{"type":..,"title":..,"url":..}]
+
+    # 案例↔知识点匹配时，向量检索用的查询文本不是完整正文（叙事体跟知识点的技术条目
+    # 语域差异太大，直接embedding整段叙事效果差），而是从正文提炼出的主题关键词——
+    # 见 knowledge_matching.py 的 _ensure_topic_keywords()，懒生成+按内容哈希缓存，
+    # 不在这里主动触发生成
+    topic_keywords = Column(Text, nullable=True)          # 从正文提炼的主题关键词（向量检索专用，不对外展示）
+    topic_keywords_source_hash = Column(String(32), nullable=True)  # 生成时对应的title+full_narrative的md5，判断是否需要重新生成
 
     status = Column(String(20), default="草稿")  # 草稿/待审核/已采纳/已驳回
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
@@ -105,6 +113,32 @@ class Case(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+def allocate_case_version_code(db, base_code: str) -> str:
+    """给同一个大纲编号（如"2.2"）多次生成案例分配互不冲突的版本号。
+    第一次生成直接用编号本身；如果案例库里已经存在这个编号（不管是原始编号还是
+    编号-N的某个历史版本），后续再生成就依次分配 编号-1、编号-2……不覆盖已有案例，
+    方便同一个编号反复试生成、审核时再从多个版本里挑一个采纳。
+    只对Case.case_code这个"展示编号"生效——跟RawMaterial.case_code（素材按大纲编号
+    分组用的字段）是两个独立的值，互不影响：素材始终按原始大纲编号分组，只有生成出的
+    Case行的编号会带版本后缀。"""
+    existing_codes = {
+        row[0] for row in
+        db.query(Case.case_code)
+        .filter(or_(Case.case_code == base_code, Case.case_code.like(f"{base_code}-%")))
+        .all()
+    }
+    if not existing_codes:
+        return base_code
+
+    suffix_re = re.compile(rf"^{re.escape(base_code)}-(\d+)$")
+    max_suffix = 0
+    for code in existing_codes:
+        m = suffix_re.match(code)
+        if m:
+            max_suffix = max(max_suffix, int(m.group(1)))
+    return f"{base_code}-{max_suffix + 1}"
 
 
 class CaseMaterial(Base):
@@ -168,7 +202,8 @@ class ChatSession(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(100), default="新对话")
-    messages = Column(Text, default="[]")  # JSON序列化的Anthropic messages格式历史
+    messages = Column(LONGTEXT, default="[]")  # JSON序列化的Anthropic messages格式历史，会带工具调用的完整
+    # 输入输出（比如知识点匹配结果），单条对话轻松超过TEXT的64KB上限，跟fetched_text一样得用LONGTEXT
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -234,6 +269,8 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_fetched_text_to_longtext()
     _migrate_add_full_narrative_draft()
+    _migrate_add_topic_keywords()
+    _migrate_messages_to_longtext()
     _seed_default_admin()
 
 
@@ -272,6 +309,29 @@ def _migrate_add_full_narrative_draft():
             conn.execute(text("ALTER TABLE cases ADD COLUMN full_narrative_draft LONGTEXT"))
     except Exception as e:
         logging.getLogger("uvicorn.error").info(f"full_narrative_draft列已存在或迁移失败（不影响启动）: {e}")
+
+
+def _migrate_messages_to_longtext():
+    """create_all不会修改已存在表的列类型；旧库的chat_sessions.messages可能还是TEXT
+    （65535字节上限），带工具调用的对话历史很容易超限报DataError，这里补一次ALTER放宽到
+    LONGTEXT，跟上面fetched_text那个迁移一样的写法。已经是LONGTEXT时该语句是空操作。"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE chat_sessions MODIFY COLUMN messages LONGTEXT"))
+    except Exception as e:
+        logging.getLogger("uvicorn.error").warning(f"chat_sessions.messages列类型迁移失败（不影响启动）: {e}")
+
+
+def _migrate_add_topic_keywords():
+    """create_all不会给已存在的表补新列——旧库的cases表还没有topic_keywords/
+    topic_keywords_source_hash这两列，这里补一次ALTER；已存在时ALTER会报错，
+    用try/except吞掉（跟上面几个迁移一样的写法），不影响启动。"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cases ADD COLUMN topic_keywords TEXT"))
+            conn.execute(text("ALTER TABLE cases ADD COLUMN topic_keywords_source_hash VARCHAR(32)"))
+    except Exception as e:
+        logging.getLogger("uvicorn.error").info(f"topic_keywords列已存在或迁移失败（不影响启动）: {e}")
 
 
 def get_db():
