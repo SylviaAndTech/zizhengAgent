@@ -7,18 +7,22 @@ AI 助手对话代理：用 LangChain 的 create_agent（内部基于 LangGraph�
 也可以是 [{"type":"text"/"tool_use"/"tool_result", ...}] 这种block列表）——
 这样不管内部用什么agent框架，前端的聊天渲染逻辑完全不用跟着改。
 """
+import contextvars
 import json
+import queue
+import threading
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
-from db import SessionLocal, RawMaterial, Case, CaseMaterial, CaseKnowledgeMapping, DIMENSIONS
-from generate_case import (
-    generate_case_draft as _generate_case_draft_impl,
-    enrich_case_with_knowledge as _enrich_case_with_knowledge_impl,
+from db import (
+    SessionLocal, RawMaterial, Case, CaseMaterial, CaseKnowledgeMapping, DIMENSIONS,
+    allocate_case_version_code,
 )
+from generate_case import generate_case_draft as _generate_case_draft_impl
+from knowledge_matching import enrich_case_from_accepted_mappings as _enrich_case_from_accepted_mappings
 from material_index import search_materials as _search_materials_impl
 from qwen_client import get_langchain_llm, require_api_key, MAX_TOOL_ROUNDS
 from audit import log_case_change
@@ -37,6 +41,20 @@ SYSTEM_PROMPT = f"""你是"思政案例生成工作台"的AI助手，帮助用�
 
 可用的思政维度：{", ".join(DIMENSIONS)}
 """
+
+# 案例生成这个工具耗时8-9分钟起步（正文写作引入了writer/judge/reviser评审循环，评审不通过
+# 时还会再多跑1轮修订+评审，实际耗时会明显超过这个下限，具体取决于CASE_NARRATIVE_MAX_ITERATIONS），
+# 用这个队列把"当前跑到第几步"从工具执行的线程实时传到
+# stream_chat()里跑SSE的那个消费循环，好在聊天界面上显示进度。用ContextVar而不是模块级
+# 全局变量，是因为如果两个用户同时在各自的聊天里触发生成，全局变量会导致进度串台；
+# ContextVar在stream_chat()新起的后台线程里各自独立设置，互不干扰。
+_progress_queue: contextvars.ContextVar = contextvars.ContextVar("progress_queue", default=None)
+
+
+def _emit_progress(stage: str):
+    q = _progress_queue.get()
+    if q is not None:
+        q.put(("progress", stage))
 
 
 @tool
@@ -98,7 +116,11 @@ def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
     """用指定的素材ID列表，调用模型生成一份新的七段式案例草稿并存入数据库。
     不需要指定思政维度——每个案例都要求对五个官方思政维度（政治认同/家国情怀/文化素养/
     宪法法治意识/道德修养）逐一给出摘录表述+解释，案例所属的书稿章节分类（也是这五个维度之一）
-    由模型结合案例内容自主判断给出。"""
+    由模型结合案例内容自主判断给出。
+    如果这个case_code在案例库里已经生成过（不管用的是不是同一批素材），不会覆盖已有案例，
+    而是自动落库成 case_code-1、case_code-2……这样的新版本编号，方便同一个编号反复试生成、
+    审核时再挑一个采纳；返回结果里的case_code字段会是实际落库用的这个版本化编号，回复用户时
+    要用这个编号，不要说成用户原来给的那个编号。"""
     db = SessionLocal()
     try:
         materials = db.query(RawMaterial).filter(RawMaterial.id.in_(material_ids)).all()
@@ -110,20 +132,21 @@ def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
             for m in success_materials
         ]
         try:
-            draft = _generate_case_draft_impl(case_code, payload)
+            draft = _generate_case_draft_impl(case_code, payload, on_stage=_emit_progress)
         except ValueError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
         case = Case(
-            case_code=case_code,
+            case_code=allocate_case_version_code(db, case_code),
             dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
             title=draft.get("title"),
             full_narrative=draft.get("full_narrative"),
+            full_narrative_draft=draft.get("full_narrative_draft"),
             teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
             sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
-            applicable_courses=json.dumps(draft.get("applicable_courses"), ensure_ascii=False),
-            teaching_design=json.dumps(draft.get("teaching_design"), ensure_ascii=False),
-            evaluation=json.dumps(draft.get("evaluation"), ensure_ascii=False),
+            # 适用课程举例/教学设计不在初次生成时产出了，等知识点匹配采纳后才会有内容
+            applicable_courses=None,
+            teaching_design=None,
             further_reading=json.dumps(draft.get("further_reading"), ensure_ascii=False),
             status="待审核",
         )
@@ -148,11 +171,11 @@ def update_case(
     sizheng_elements: dict = None,
     applicable_courses: list = None,
     teaching_design: dict = None,
-    evaluation: dict = None,
     further_reading: list = None,
     status: str = None,
 ) -> str:
     """更新某个案例的字段（比如修改标题、完整案例正文、教学设计等），只传需要修改的字段。
+    适用课程举例/教学设计通常由知识点匹配采纳后自动生成，不建议在这里手工瞎编；
     status 取值范围：草稿/待审核/已采纳/已驳回"""
     db = SessionLocal()
     try:
@@ -164,7 +187,7 @@ def update_case(
             "title": title, "full_narrative": full_narrative,
             "teaching_objectives": teaching_objectives, "sizheng_elements": sizheng_elements,
             "applicable_courses": applicable_courses, "teaching_design": teaching_design,
-            "evaluation": evaluation, "further_reading": further_reading, "status": status,
+            "further_reading": further_reading, "status": status,
         }
         changes = {}
         for field, value in fields.items():
@@ -190,47 +213,30 @@ def enrich_case_with_accepted_knowledge(case_id: int) -> str:
     """用某个案例在「知识点匹配」页面已经人工标记为"已采纳"的知识点关联，调用模型补充/更新
     这个案例的"适用课程举例"与"教学设计"两个字段，并直接写回数据库。这个案例必须已经跑过
     知识点匹配、且至少有一条被标记为"已采纳"，否则会返回error，如果报错就把这个情况告诉用户，
-    不要自己凭空编造适用课程举例/教学设计的内容。"""
+    不要自己凭空编造适用课程举例/教学设计的内容。
+    注意：现在采纳/取消采纳知识点关联时后台会自动触发这个逻辑，这个工具通常已经不需要
+    手动调用了，只有用户明确要求"重新生成"之类的场景才用得上。"""
     db = SessionLocal()
     try:
         case = db.query(Case).filter(Case.id == case_id).first()
         if not case:
             return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
 
-        accepted = (
+        has_accepted = (
             db.query(CaseKnowledgeMapping)
             .filter(CaseKnowledgeMapping.case_id == case_id, CaseKnowledgeMapping.status == "已采纳")
-            .all()
+            .first()
         )
-        if not accepted:
+        if not has_accepted:
             return json.dumps(
                 {"error": "这个案例还没有已采纳的知识点关联，请先在「知识点匹配」页面运行匹配并采纳至少一条"},
                 ensure_ascii=False,
             )
 
-        accepted_payload = [
-            {
-                "course_name": m.knowledge_point.course_name,
-                "chapter": m.knowledge_point.chapter,
-                "description": m.knowledge_point.description,
-                "suggestion_text": m.suggestion_text,
-            }
-            for m in accepted
-        ]
         try:
-            enrichment = _enrich_case_with_knowledge_impl(case.to_dict(), accepted_payload)
+            changes = _enrich_case_from_accepted_mappings(db, case)
         except ValueError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-        changes = {}
-        for field in ("applicable_courses", "teaching_design"):
-            if field not in enrichment:
-                continue
-            old_value = getattr(case, field, None)
-            new_value = json.dumps(enrichment[field], ensure_ascii=False)
-            if old_value != new_value:
-                changes[field] = {"old": old_value, "new": new_value}
-            setattr(case, field, new_value)
 
         db.commit()
         db.refresh(case)
@@ -312,9 +318,15 @@ def stream_chat(stored_messages: list[dict], user_message: str):
       用它的最后一次取值作为最终要落库的完整对话历史——这样不用自己拼工具调用参数/结果，
       直接复用和非流式版一样的、LangGraph已经组装好的准确状态。
 
+    真正的.stream()迭代放在后台线程（_run_agent）里跑，本函数只从队列里取事件转成yield——
+    这样案例生成这类耗时8-9分钟的工具调用执行期间，工具内部通过_emit_progress塞进同一个
+    队列的进度事件，能穿插在正常的token/tool_call事件之间实时冒出来，而不是让整个生成器
+    在工具调用返回之前完全没有任何输出。
+
     yield出的事件：
       {"type": "token", "text": ...}                          —— 增量文本，直接拼到当前气泡上
       {"type": "tool_call", "name": ...}                       —— 检测到一次工具调用，前端展示一个工具chip
+      {"type": "progress", "stage": ...}                       —— 耗时工具调用期间的阶段性进度（比如案例生成的四步）
       {"type": "done", "messages": [...], "reply": ...}        —— 流结束，附最终要落库的完整历史
       {"type": "error", "message": ...}                        —— 出错，调用方决定要不要落库当前进度
     """
@@ -323,42 +335,76 @@ def stream_chat(stored_messages: list[dict], user_message: str):
     history = _to_langchain_messages(stored_messages) if stored_messages else []
     history.append(HumanMessage(content=user_message))
 
+    q: queue.Queue = queue.Queue()
+
+    def _run_agent():
+        _progress_queue.set(q)  # ContextVar不会跨线程自动传播，要在新线程内部重新设置
+        try:
+            for mode, chunk in _get_agent().stream(
+                {"messages": history},
+                config={"recursion_limit": MAX_TOOL_ROUNDS * 2 + 1},
+                stream_mode=["messages", "values"],
+            ):
+                q.put(("event", mode, chunk))
+        except GraphRecursionError:
+            q.put(("recursion_error", None))
+        except Exception as e:
+            q.put(("exception", e))
+        finally:
+            q.put(("sentinel", None))
+
+    thread = threading.Thread(target=_run_agent, daemon=True)
+    thread.start()
+
     final_state = None
     seen_tool_call_ids = set()
 
-    try:
-        for mode, chunk in _get_agent().stream(
-            {"messages": history},
-            config={"recursion_limit": MAX_TOOL_ROUNDS * 2 + 1},
-            stream_mode=["messages", "values"],
-        ):
-            if mode == "values":
-                final_state = chunk
-                continue
+    while True:
+        item = q.get()
+        kind = item[0]
 
-            # mode == "messages"：chunk 是 (message_chunk, metadata)
-            msg_chunk, meta = chunk
-            if meta.get("langgraph_node") != "model":
-                continue  # 跳过tools节点吐出的ToolMessage整块内容，那个不是给用户逐字看的
+        if kind == "sentinel":
+            break
 
-            content = getattr(msg_chunk, "content", None)
-            if content:
-                yield {"type": "token", "text": content}
+        if kind == "recursion_error":
+            reply = "（工具调用次数过多，已中止，请换个更具体的说法重试）"
+            yield {"type": "token", "text": reply}
+            yield {"type": "done", "messages": _from_langchain_messages(history), "reply": reply}
+            return
 
-            for tc in (getattr(msg_chunk, "tool_call_chunks", None) or []):
-                tc_id = tc.get("id")
-                name = tc.get("name")
-                if name and tc_id and tc_id not in seen_tool_call_ids:
-                    seen_tool_call_ids.add(tc_id)
-                    yield {"type": "tool_call", "name": name}
-    except GraphRecursionError:
-        reply = "（工具调用次数过多，已中止，请换个更具体的说法重试）"
-        yield {"type": "token", "text": reply}
-        yield {"type": "done", "messages": _from_langchain_messages(history), "reply": reply}
-        return
-    except Exception as e:
-        yield {"type": "error", "message": str(e)}
-        return
+        if kind == "exception":
+            _, exc = item
+            yield {"type": "error", "message": str(exc)}
+            return
+
+        if kind == "progress":
+            _, stage = item
+            yield {"type": "progress", "stage": stage}
+            continue
+
+        # kind == "event"：item是("event", mode, chunk)，跟原来for循环里拿到的一样
+        _, mode, chunk = item
+        if mode == "values":
+            final_state = chunk
+            continue
+
+        # mode == "messages"：chunk 是 (message_chunk, metadata)
+        msg_chunk, meta = chunk
+        if meta.get("langgraph_node") != "model":
+            continue  # 跳过tools节点吐出的ToolMessage整块内容，那个不是给用户逐字看的
+
+        content = getattr(msg_chunk, "content", None)
+        if content:
+            yield {"type": "token", "text": content}
+
+        for tc in (getattr(msg_chunk, "tool_call_chunks", None) or []):
+            tc_id = tc.get("id")
+            name = tc.get("name")
+            if name and tc_id and tc_id not in seen_tool_call_ids:
+                seen_tool_call_ids.add(tc_id)
+                yield {"type": "tool_call", "name": name}
+
+    thread.join()
 
     updated_messages = final_state["messages"] if final_state else history
     reply = ""

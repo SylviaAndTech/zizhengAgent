@@ -5,6 +5,11 @@
 <title>思政案例生成工作台 - 原型</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "base" });
+  window.mermaid = mermaid;
+</script>
 <style>
   :root {
     --primary: #b3282d;
@@ -151,6 +156,8 @@
   .section-title { font-weight: 600; font-size: 14px; margin: 16px 0 6px; display: flex; align-items: center; gap: 8px; }
   .section-title .badge { background: #f0e8de; color: #8a6a3a; font-size: 11px; padding: 2px 8px; border-radius: 4px; }
   .narrative-box { white-space: pre-wrap; line-height: 1.9; font-size: 14px; background: #fbfaf8; border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .mermaid-tree { overflow-x: auto; background: #fbfaf8; border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .mermaid-tree svg { max-width: none; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
   th, td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
   th { background: #f0ece7; }
@@ -207,14 +214,52 @@
   .cite-tooltip .ct-title { font-weight: 700; margin-bottom: 4px; color: #fff; }
   .cite-tooltip .ct-snippet mark { background: #b3282d; color: #fff; border-radius: 2px; padding: 0 2px; }
   .cite-tooltip .ct-hint { color: #b7afa3; margin-top: 4px; font-size: 11px; }
+
+  /* ---------- 登录 ---------- */
+  .login-overlay {
+    position: fixed; inset: 0; z-index: 2000; background: #f7f4ee;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .login-card {
+    width: 320px; background: #fff; border: 1px solid var(--border); border-radius: 10px;
+    padding: 32px 28px; box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+  }
+  .login-card h2 { margin: 0 0 4px; font-size: 18px; }
+  .login-hint { color: #8a8378; font-size: 13px; margin: 0 0 18px; }
+  .login-card input {
+    width: 100%; box-sizing: border-box; margin-bottom: 12px; padding: 9px 10px;
+    border: 1px solid var(--border); border-radius: 6px; font-size: 14px;
+  }
+  .login-card button {
+    width: 100%; padding: 9px 0; margin-top: 4px;
+  }
+  .login-error { color: #b3282d; font-size: 12.5px; min-height: 18px; margin-bottom: 4px; }
+  .header-user { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #8a8378; }
+  .header-user button.secondary { padding: 4px 10px; font-size: 12.5px; }
 </style>
 </head>
 <body>
+
+<div class="login-overlay" id="loginOverlay" style="display:none;">
+  <div class="login-card">
+    <h2>📘 思政案例生成工作台</h2>
+    <p class="login-hint">请登录后使用</p>
+    <input type="text" id="loginUsername" placeholder="用户名" autocomplete="username" />
+    <input type="password" id="loginPassword" placeholder="密码" autocomplete="current-password"
+           onkeydown="if(event.key==='Enter'){doLogin();}" />
+    <div class="login-error" id="loginError"></div>
+    <button onclick="doLogin()">登录</button>
+  </div>
+</div>
 
 <div class="app-header">
   <div>
     <h1>📘 思政案例生成工作台</h1>
     <div class="subtitle">素材导入 → AI助手对话生成/编辑 → 案例库审核导出 → 知识点匹配补充 | 原型 v0.3</div>
+  </div>
+  <div class="header-user" id="headerUser" style="display:none;">
+    <span id="currentUsernameLabel"></span>
+    <button class="secondary" onclick="doLogout()">退出登录</button>
   </div>
 </div>
 
@@ -365,8 +410,8 @@
   <div class="card">
     <h2>知识图谱</h2>
     <div class="chat-hint" style="text-align:left;padding:0 0 6px;">基于"已采纳"状态的案例、以及已采纳的知识点关联，画出 维度→案例→知识点 三层关系图。</div>
-    <button class="secondary" onclick="window.open(API_BASE + '/api/knowledge_graph.png', '_blank')">🖼 查看图谱（图片）</button>
-    <button class="secondary" onclick="window.open(API_BASE + '/api/knowledge_graph.html', '_blank')">🕸 查看图谱（可交互）</button>
+    <button class="secondary" onclick="viewProtectedResource(API_BASE + '/api/knowledge_graph.png')">🖼 查看图谱（图片）</button>
+    <button class="secondary" onclick="viewProtectedResource(API_BASE + '/api/knowledge_graph.html')">🕸 查看图谱（可交互）</button>
   </div>
 
   <div class="card">
@@ -374,14 +419,14 @@
     <div class="inline-row">
       <div>
         <label>选择案例</label>
-        <select id="matchCaseSelect"></select>
+        <select id="matchCaseSelect" onchange="loadCaseMappings(this.value)"></select>
       </div>
       <div style="flex:0;">
         <button id="runMatchBtn" onclick="runMatch()">🔍 运行匹配</button>
       </div>
     </div>
     <div id="matchLoading" class="loading" style="display:none;">⏳ 正在匹配中，请稍候...</div>
-    <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div></div>
+    <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">该案例还没有匹配记录，点击上方"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div></div>
     <button onclick="enrichCurrentCase()" style="background:var(--success)">✨ 用已采纳的知识点，补充该案例的「适用课程举例」与「教学设计」（在AI助手对话里进行）</button>
   </div>
 </div>
@@ -401,6 +446,94 @@
 
 <script>
 const API_BASE = "http://localhost:8082";
+
+/* ---------- 登录鉴权 ---------- */
+// 用Authorization请求头带token，不用cookie——前端和后端在开发环境是两个不同origin，
+// 跨源cookie在纯HTTP下受SameSite/Secure策略限制很难可靠工作，token方案不受这个限制。
+async function apiFetch(url, options = {}) {
+  const token = localStorage.getItem("auth_token");
+  const headers = { ...(options.headers || {}) };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401) {
+    localStorage.removeItem("auth_token");
+    showLoginScreen();
+  }
+  return res;
+}
+
+// window.open(url)/直接跳转这种方式，浏览器不会带上自定义请求头（只有fetch/XHR能设置
+// Authorization），所以像知识图谱这类受保护接口不能直接window.open，要先用apiFetch（带上
+// token）把内容拉下来，再用blob URL在新标签页里打开——用户看到的效果跟直接打开链接一样，
+// 但请求真的带了登录凭证。
+async function viewProtectedResource(url) {
+  try {
+    const res = await apiFetch(url);
+    if (!res.ok) { toast(`加载失败(${res.status})`); return; }
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    window.open(blobUrl, "_blank");
+  } catch (e) {
+    toast("加载出错: " + e.message);
+  }
+}
+
+function showLoginScreen() {
+  document.getElementById("loginOverlay").style.display = "flex";
+  document.getElementById("headerUser").style.display = "none";
+}
+
+function showAppAfterLogin(username) {
+  document.getElementById("loginOverlay").style.display = "none";
+  document.getElementById("headerUser").style.display = "flex";
+  document.getElementById("currentUsernameLabel").textContent = username || "";
+}
+
+async function doLogin() {
+  const username = document.getElementById("loginUsername").value.trim();
+  const password = document.getElementById("loginPassword").value;
+  const errEl = document.getElementById("loginError");
+  errEl.textContent = "";
+  if (!username || !password) { errEl.textContent = "请输入用户名和密码"; return; }
+  try {
+    const res = await apiFetch(`${API_BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "登录失败");
+    localStorage.setItem("auth_token", data.token);
+    showAppAfterLogin(data.username);
+    bootApp();
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+}
+
+async function doLogout() {
+  try { await apiFetch(`${API_BASE}/api/auth/logout`, { method: "POST" }); } catch (e) { /* 忽略网络错误，反正也要清本地token */ }
+  localStorage.removeItem("auth_token");
+  location.reload();
+}
+
+// 页面加载时调用一次：有token就校验一下是否还有效，没token/无效就显示登录框；
+// AUTH_ENABLED=false（测试模式）时后端不管有没有token都直接放行，这里也会顺利通过
+async function checkAuthAndBoot() {
+  const token = localStorage.getItem("auth_token");
+  try {
+    const res = await apiFetch(`${API_BASE}/api/auth/me`, {
+      headers: token ? { "Authorization": `Bearer ${token}` } : {},
+    });
+    if (res.ok) {
+      const data = await res.json();
+      showAppAfterLogin(data.username);
+      bootApp();
+      return;
+    }
+  } catch (e) { /* 网络错误，走下面显示登录框 */ }
+  showLoginScreen();
+}
 
 let materialsCache = [];
 let selectedMaterialIds = new Set();
@@ -476,6 +609,28 @@ function addToolChip(container, text) {
   container.appendChild(div);
 }
 
+// 案例生成走四段式流水线，耗时8-9分钟；这个进度提示原地更新（不是每一步都新增一条消息），
+// 流结束后sendChat()会整体重渲染聊天框（按落库的chatHistory重建DOM），进度事件从不落库，
+// 所以这个临时chip到时候会被自然覆盖掉，不需要手动清理
+const GENERATION_STAGES = ["事实提炼", "正文初稿", "去AI味改写", "结构化字段"];
+let currentProgressChip = null;
+
+function resetProgressChip() {
+  currentProgressChip = null;
+}
+
+function updateProgressChip(container, stage) {
+  const idx = GENERATION_STAGES.indexOf(stage);
+  const label = idx >= 0 ? `⏳ ${stage}中 (${idx + 1}/${GENERATION_STAGES.length})` : `⏳ ${stage}中`;
+  if (!currentProgressChip || !currentProgressChip.isConnected) {
+    currentProgressChip = document.createElement("div");
+    currentProgressChip.className = "tool-chip";
+    container.appendChild(currentProgressChip);
+  }
+  currentProgressChip.textContent = label;
+  container.scrollTop = container.scrollHeight;
+}
+
 // 这两个工具调用成功后返回的是完整的案例对象（Case.to_dict()），可以直接给用户一个案例链接
 const CASE_LINK_TOOLS = new Set(["generate_case_draft", "update_case"]);
 
@@ -490,7 +645,7 @@ function addCaseLinkChip(container, caseObj) {
 async function openCaseFromChat(id) {
   if (!casesCache.find(c => c.id === id)) {
     try {
-      const res = await fetch(`${API_BASE}/api/cases/${id}`);
+      const res = await apiFetch(`${API_BASE}/api/cases/${id}`);
       if (res.ok) casesCache.unshift(await res.json());
     } catch (e) {
       // 拿不到就算了，下面openCaseDetail找不到会静默不弹窗
@@ -554,13 +709,13 @@ function renderChatMessages() {
 
 function setChatLoading(loading) {
   document.getElementById("chatStatusHint").textContent = loading
-    ? "AI助手正在处理中，如果涉及生成/改写全文可能需要10-30秒，请稍候..."
+    ? "AI助手正在处理中，如果涉及生成新案例（事实提炼→写正文→去AI味润色→补全其余字段，分四步走，正文现在要求写够2200字以上）实测可能需要10-20分钟，请不要关闭页面；其余的编辑/改写操作通常10-30秒，请稍候..."
     : "案例生成、逐段编辑、审核状态调整都可以直接在这里用自然语言完成；素材导入和最终导出仍在专门的标签页里。";
 }
 
 /* ---- 会话（session）管理：左侧栏历史记录 ---- */
 async function loadSessions() {
-  const res = await fetch(`${API_BASE}/api/chat/sessions`);
+  const res = await apiFetch(`${API_BASE}/api/chat/sessions`);
   sessionsCache = await res.json();
   if (sessionsCache.length === 0) {
     await createNewSession();
@@ -583,7 +738,7 @@ function renderSessionList() {
 }
 
 async function createNewSession() {
-  const res = await fetch(`${API_BASE}/api/chat/sessions`, { method: "POST" });
+  const res = await apiFetch(`${API_BASE}/api/chat/sessions`, { method: "POST" });
   const session = await res.json();
   sessionsCache.unshift({ id: session.id, title: session.title, updated_at: session.updated_at, message_count: 0 });
   currentSessionId = session.id;
@@ -595,7 +750,7 @@ async function createNewSession() {
 async function switchSession(id) {
   if (id === currentSessionId) return;
   currentSessionId = id;
-  const res = await fetch(`${API_BASE}/api/chat/sessions/${id}`);
+  const res = await apiFetch(`${API_BASE}/api/chat/sessions/${id}`);
   const session = await res.json();
   chatHistory = session.messages || [];
   renderSessionList();
@@ -603,7 +758,7 @@ async function switchSession(id) {
 }
 
 async function deleteSession(id) {
-  await fetch(`${API_BASE}/api/chat/sessions/${id}`, { method: "DELETE" });
+  await apiFetch(`${API_BASE}/api/chat/sessions/${id}`, { method: "DELETE" });
   sessionsCache = sessionsCache.filter(s => s.id !== id);
   if (currentSessionId === id) {
     currentSessionId = null;
@@ -640,7 +795,7 @@ async function sendChat(overrideText) {
   };
 
   try {
-    const res = await fetch(`${API_BASE}/api/chat`, {
+    const res = await apiFetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: currentSessionId, message: rawText }),
@@ -677,8 +832,11 @@ async function sendChat(overrideText) {
           box.scrollTop = box.scrollHeight;
         } else if (payload.type === "tool_call") {
           flushBubble();
+          resetProgressChip(); // 每次新工具调用都重开一个进度chip，避免上一次生成的进度残留
           addToolChip(box, `🔧 调用工具：${payload.name}`);
           box.scrollTop = box.scrollHeight;
+        } else if (payload.type === "progress") {
+          updateProgressChip(box, payload.stage);
         } else if (payload.type === "error") {
           throw new Error(payload.message);
         } else if (payload.type === "done") {
@@ -744,7 +902,7 @@ async function importMaterials() {
   }
   document.getElementById("importLoading").style.display = "block";
   try {
-    const res = await fetch(`${API_BASE}/api/materials/import`, {
+    const res = await apiFetch(`${API_BASE}/api/materials/import`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ case_code: caseCode, urls }),
@@ -787,7 +945,7 @@ async function uploadFile(file) {
 
   document.getElementById("uploadLoading").style.display = "block";
   try {
-    const res = await fetch(`${API_BASE}/api/materials/upload`, { method: "POST", body: formData });
+    const res = await apiFetch(`${API_BASE}/api/materials/upload`, { method: "POST", body: formData });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "上传失败");
     toast(`《${file.name}》解析完成，拆分出 ${data.segment_count} 条候选案例，已存入素材库`);
@@ -805,7 +963,7 @@ const SOURCE_ICON = { url: "🔗", docx: "📝", pdf: "📄" };
 const SIZHENG_DIMENSIONS = ["政治认同", "家国情怀", "文化素养", "宪法法治意识", "道德修养"];
 
 async function loadMaterialCaseCodes() {
-  const res = await fetch(`${API_BASE}/api/materials/case_codes`);
+  const res = await apiFetch(`${API_BASE}/api/materials/case_codes`);
   const data = await res.json();
 
   const filterSel = document.getElementById("materialCaseFilter");
@@ -827,7 +985,7 @@ async function loadMaterials() {
   if (caseCode) params.set("case_code", caseCode);
   if (q) params.set("q", q);
 
-  const res = await fetch(`${API_BASE}/api/materials?${params.toString()}`);
+  const res = await apiFetch(`${API_BASE}/api/materials?${params.toString()}`);
   materialsCache = await res.json();
   renderMaterialList();
 }
@@ -893,7 +1051,7 @@ function clearMaterialSelection() {
 async function deleteMaterial(id) {
   if (!confirm("确定删除这条素材吗？删除后不可恢复。")) return;
   try {
-    const res = await fetch(`${API_BASE}/api/materials/${id}`, { method: "DELETE" });
+    const res = await apiFetch(`${API_BASE}/api/materials/${id}`, { method: "DELETE" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "删除失败");
     selectedMaterialIds.delete(id);
@@ -918,7 +1076,7 @@ function closePreview() {
 
 /* ================= 案例库：列表 + 勾选导出Word ================= */
 async function loadCases() {
-  const res = await fetch(`${API_BASE}/api/cases`);
+  const res = await apiFetch(`${API_BASE}/api/cases`);
   casesCache = await res.json();
   renderCaseList();
   populateMatchCaseSelect();
@@ -956,7 +1114,7 @@ async function deleteSelectedCases() {
   if (!confirm(`确定删除勾选的 ${ids.length} 个案例吗？删除后不可恢复。`)) return;
 
   const results = await Promise.allSettled(
-    ids.map(id => fetch(`${API_BASE}/api/cases/${id}`, { method: "DELETE" }))
+    ids.map(id => apiFetch(`${API_BASE}/api/cases/${id}`, { method: "DELETE" }))
   );
   const failCount = results.filter(r => r.status === "rejected" || !r.value.ok).length;
   selectedCaseIds.clear();
@@ -979,13 +1137,15 @@ async function openCaseDetail(id) {
   document.getElementById("previewBody").innerHTML = editBtnHtml + renderCaseDetailHTML(c) +
     '<div class="section-title">📝 修改记录</div><div class="loading">加载中...</div>';
   document.getElementById("previewModal").classList.add("active");
+  renderCourseTree(c);
 
   loadCaseMaterialsForCitations(id); // 不等它，加载完悬浮预览自然就能用了，不阻塞详情本身的展示
 
   try {
-    const res = await fetch(`${API_BASE}/api/cases/${id}/audit_log`);
+    const res = await apiFetch(`${API_BASE}/api/cases/${id}/audit_log`);
     const logs = await res.json();
     document.getElementById("previewBody").innerHTML = editBtnHtml + renderCaseDetailHTML(c) + renderAuditLogHTML(logs);
+    renderCourseTree(c);
   } catch (e) {
     // 修改记录加载失败不影响案例详情本身的展示，静默即可
   }
@@ -997,7 +1157,7 @@ const caseMaterialsCache = {}; // case_id -> [{id,url,title,full_text}, ...]，�
 async function loadCaseMaterialsForCitations(caseId) {
   if (caseMaterialsCache[caseId]) return caseMaterialsCache[caseId];
   try {
-    const res = await fetch(`${API_BASE}/api/cases/${caseId}/materials`);
+    const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/materials`);
     const data = await res.json();
     caseMaterialsCache[caseId] = data.materials || [];
   } catch (e) {
@@ -1025,6 +1185,23 @@ function renderNarrativeWithCitations(caseId, text) {
   return html;
 }
 
+function toggleNarrativeDraft(caseId) {
+  const box = document.getElementById(`narrativeDraft_${caseId}`);
+  const toggle = document.getElementById(`narrativeDraftToggle_${caseId}`);
+  if (!box) return;
+  const showing = box.style.display !== "none";
+  box.style.display = showing ? "none" : "block";
+  if (toggle) toggle.innerHTML = `📝 查看"去AI味"改写前的初稿 ${showing ? "▼" : "▲"}`;
+}
+
+// 直引号/弯引号视为同一个字符再比较——去AI味改写那一步经常会顺手把正文里的引号统一成
+// 弯引号，偶尔连方括号[素材N:定位短语]标注里的字符也会跟着被改掉一两个，虽然已经在
+// prompt里明确要求不能动标注里的字符，但不能完全指望模型每次都严格遵守，这里做一层
+// 容错，不然这种情况下用户会看到"没能在原文里精确定位到这句引用"，明明内容其实是对的
+function _normalizeQuotes(s) {
+  return s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+}
+
 function showCiteTooltip(el) {
   const caseId = Number(el.dataset.caseId);
   const idx = Number(el.dataset.idx);
@@ -1040,7 +1217,12 @@ function showCiteTooltip(el) {
       tooltip.innerHTML = `<div class="ct-hint">没有找到"素材${idx}"，可能是案例正文标注有误</div>`;
     } else {
       const fullText = material.full_text || "";
-      const pos = anchor ? fullText.indexOf(anchor) : -1;
+      // 先按原文精确匹配；找不到再按"引号统一后"的版本匹配一次（两个字符串长度相同，
+      // 引号是1对1替换，匹配到的下标在原文里位置不变，可以直接复用来截取展示片段）
+      let pos = anchor ? fullText.indexOf(anchor) : -1;
+      if (pos < 0 && anchor) {
+        pos = _normalizeQuotes(fullText).indexOf(_normalizeQuotes(anchor));
+      }
       let snippetHtml;
       if (pos >= 0) {
         const start = Math.max(0, pos - 40);
@@ -1094,13 +1276,21 @@ function renderAuditLogHTML(logs) {
 function renderCaseDetailHTML(c) {
   const to = c.teaching_objectives || {};
   const se = c.sizheng_elements || {};
-  const td = c.teaching_design || {};
-  const ev = c.evaluation || {};
-  const courses = c.applicable_courses || [];
+  const td = c.teaching_design; // null表示还没生成（要等知识点匹配采纳后才会有）
+  const courses = c.applicable_courses; // 同上，null跟[]要区分对待，null才是"尚未生成"
   const reading = c.further_reading || [];
   return `
     <div class="section-title">① 完整案例</div>
     <div class="narrative-box">${renderNarrativeWithCitations(c.id, c.full_narrative || "")}</div>
+    ${c.full_narrative_draft ? `
+    <div style="margin-top:8px;">
+      <span class="suggestion-preview" id="narrativeDraftToggle_${c.id}" style="display:inline-block;color:var(--primary);" onclick="toggleNarrativeDraft(${c.id})">
+        📝 查看"去AI味"改写前的初稿 ▼
+      </span>
+      <div class="narrative-box" style="margin-top:6px;background:#f5f0ea;display:none;" id="narrativeDraft_${c.id}">
+        ${renderNarrativeWithCitations(c.id, c.full_narrative_draft)}
+      </div>
+    </div>` : ""}
 
     <div class="section-title">② 案例教学目标</div>
     <table>
@@ -1120,31 +1310,131 @@ function renderCaseDetailHTML(c) {
     </table>
 
     <div class="section-title">④ 适用课程举例</div>
-    <table>
-      <tr><th>课程名称</th><th>适用章节</th><th>融入方式建议</th></tr>
-      ${courses.map(r => `<tr><td>${escHtml(r["课程名称"] || "")}</td><td>${escHtml(r["适用章节"] || "")}</td><td>${escHtml(r["融入方式建议"] || "")}</td></tr>`).join("")}
-    </table>
+    ${!courses || courses.length === 0 ? `
+    <div class="empty-hint">尚未生成——请先在「知识点匹配」页面为这个案例匹配并采纳知识点，采纳后会自动生成</div>
+    ` : `
+    <div class="mermaid-tree" id="courseTree_${c.id}"><div class="loading">树状图渲染中…</div></div>
+    <div style="margin-top:8px;">
+      <span class="suggestion-preview" id="courseTableToggle_${c.id}" style="display:inline-block;color:var(--primary);" onclick="toggleCourseTable(${c.id})">
+        📊 查看表格明细（含融入方式建议） ▼
+      </span>
+      <table style="display:none;margin-top:6px;" id="courseTable_${c.id}">
+        <tr><th>课程名称</th><th>适用章节</th><th>融入方式建议</th></tr>
+        ${courses.map(r => `<tr><td>${escHtml(r["课程名称"] || "")}</td><td>${escHtml(r["适用章节"] || "")}</td><td>${escHtml(r["融入方式建议"] || "")}</td></tr>`).join("")}
+      </table>
+    </div>
+    `}
 
     <div class="section-title">⑤ 教学设计</div>
+    ${!td || Object.keys(td).length === 0 ? `
+    <div class="empty-hint">尚未生成——请先在「知识点匹配」页面为这个案例匹配并采纳知识点，采纳后会自动生成</div>
+    ` : `
     <table>
       <tr><th>课前</th><td>${escHtml(td["课前"] || "")}</td></tr>
       <tr><th>课中</th><td>${escHtml(td["课中"] || "")}</td></tr>
       <tr><th>课后</th><td>${escHtml(td["课后"] || "")}</td></tr>
     </table>
+    `}
 
-    <div class="section-title">⑥ 课程评价与成效</div>
-    <table>
-      <tr><th>目标达成度</th><td>${escHtml(ev["目标达成度"] || "")}</td></tr>
-      <tr><th>过程参与度</th><td>${escHtml(ev["过程参与度"] || "")}</td></tr>
-      <tr><th>教学反思</th><td>${escHtml(ev["教学反思"] || "")}</td></tr>
-    </table>
-
-    <div class="section-title">⑦ 延伸阅读</div>
+    <div class="section-title">⑥ 延伸阅读</div>
     <table>
       <tr><th>类型</th><th>标题</th><th>链接</th></tr>
       ${reading.map(r => `<tr><td>${escHtml(r.type || "")}</td><td>${escHtml(r.title || "")}</td><td><a href="${escHtml(r.url || "")}" target="_blank">${escHtml(r.url || "")}</a></td></tr>`).join("")}
     </table>
   `;
+}
+
+function toggleCourseTable(caseId) {
+  const box = document.getElementById(`courseTable_${caseId}`);
+  const toggle = document.getElementById(`courseTableToggle_${caseId}`);
+  if (!box) return;
+  const showing = box.style.display !== "none";
+  box.style.display = showing ? "none" : "table";
+  if (toggle) toggle.innerHTML = `📊 查看表格明细（含融入方式建议） ${showing ? "▼" : "▲"}`;
+}
+
+// mermaid节点标签只能用双引号包裹的文本，标签内不能再出现裸的双引号/方括号，否则会破坏
+// 语法结构；换行统一转成<br/>（mermaid标签支持这个标签）。Mermaid不会自动给节点内的文字
+// 换行——文字多长，节点就撑多宽，所以超过wrapLen字符数时手动按字符数插入<br/>分行，让
+// 文字分成多行显示在框内；之前是直接截断加"…"丢弃后半段内容，导致知识点简述这类偏长的
+// 技术描述看不全，改成换行后能保证全部文字都显示出来。
+// 跟backend/mermaid_tree.py的mermaid_escape()是同一份逻辑的两处实现（导出Word用Playwright
+// 无头浏览器渲染这张图时要用Python重新生成一遍定义字符串），两边的换行宽度/转义规则必须
+// 保持一致，改一处要记得同步改另一处，否则"页面上看到的图"和"导出Word里嵌的图"会不一样。
+function mermaidEsc(s, wrapLen) {
+  let t = String(s || "").trim().replace(/["\[\]]/g, "").replace(/\s*\n+\s*/g, "<br/>");
+  if (wrapLen) {
+    t = t.split("<br/>").map(seg => {
+      const chars = Array.from(seg); // 用Array.from而不是按length切，避免把代理对/组合字符切断
+      if (chars.length <= wrapLen) return seg;
+      const lines = [];
+      for (let i = 0; i < chars.length; i += wrapLen) lines.push(chars.slice(i, i + wrapLen).join(""));
+      return lines.join("<br/>");
+    }).join("<br/>");
+  }
+  return t;
+}
+
+// 案例详情里"④ 适用课程举例"的树状图：第一层案例编号+名字，第二层课程名字，第三层
+// 章节，第四层知识点简述（同一课程/章节下可能有多条已采纳的知识点，各自一个叶子节点）。
+// applicable_courses每一行对应一条"已采纳的知识点关联"生成的结果，见knowledge_matching.py
+// enrich_case_from_accepted_mappings()——这里只是把同一课程/章节的行分组画成树，不改数据。
+function buildApplicableCoursesMermaid(c) {
+  const courses = c.applicable_courses;
+  if (!courses || courses.length === 0) return null;
+
+  const lines = [
+    "graph LR",
+    "classDef caseNode fill:#4F46E5,stroke:#3730A3,stroke-width:2px,color:#FFFFFF,rx:8px,ry:8px;",
+    "classDef courseNode fill:#0EA5E9,stroke:#0369A1,stroke-width:2px,color:#FFFFFF,rx:6px,ry:6px;",
+    "classDef chapterNode fill:#10B981,stroke:#047857,stroke-width:2px,color:#FFFFFF,rx:6px,ry:6px;",
+    "classDef kpNode fill:#F3F4F6,stroke:#D1D5DB,stroke-width:1.5px,color:#1F2937,rx:6px,ry:6px;",
+    `CASE["案例 ${mermaidEsc(c.case_code)}<br/>${mermaidEsc(c.title, 16)}"]:::caseNode`,
+  ];
+
+  const courseMap = new Map(); // 课程名 -> Map(章节名 -> [知识点简述, ...])
+  courses.forEach(row => {
+    const courseName = (row["课程名称"] || "").trim() || "(未命名课程)";
+    const chapterName = (row["适用章节"] || "").trim() || "(未标注章节)";
+    const kp = (row["知识点简述"] || "").trim();
+    if (!courseMap.has(courseName)) courseMap.set(courseName, new Map());
+    const chapterMap = courseMap.get(courseName);
+    if (!chapterMap.has(chapterName)) chapterMap.set(chapterName, []);
+    if (kp) chapterMap.get(chapterName).push(kp);
+  });
+
+  let ci = 0;
+  for (const [courseName, chapterMap] of courseMap) {
+    ci++;
+    const cid = `C${ci}`;
+    lines.push(`CASE --> ${cid}["课程：${mermaidEsc(courseName, 16)}"]:::courseNode`);
+    let chi = 0;
+    for (const [chapterName, kps] of chapterMap) {
+      chi++;
+      const chid = `${cid}_CH${chi}`;
+      lines.push(`${cid} --> ${chid}["${mermaidEsc(chapterName, 16)}"]:::chapterNode`);
+      kps.forEach((kp, ki) => {
+        const kpid = `${chid}_KP${ki + 1}`;
+        lines.push(`${chid} --> ${kpid}["知识点：${mermaidEsc(kp, 16)}"]:::kpNode`);
+      });
+    }
+  }
+  return lines.join("\n");
+}
+
+let _mermaidRenderSeq = 0;
+async function renderCourseTree(c) {
+  const container = document.getElementById(`courseTree_${c.id}`);
+  if (!container) return;
+  const def = buildApplicableCoursesMermaid(c);
+  if (!def) return;
+  try {
+    _mermaidRenderSeq++;
+    const { svg } = await window.mermaid.render(`courseTreeSvg_${c.id}_${_mermaidRenderSeq}`, def);
+    container.innerHTML = svg;
+  } catch (e) {
+    container.innerHTML = '<div class="empty-hint">树状图渲染失败</div>';
+  }
 }
 
 /* ================= 案例库：直接编辑案例内容 ================= */
@@ -1158,6 +1448,7 @@ function openCaseEdit(id) {
   editingCaseId = id;
   editCourseRows = (c.applicable_courses || []).map(r => ({
     name: r["课程名称"] || "", chapter: r["适用章节"] || "", suggestion: r["融入方式建议"] || "",
+    kp: r["知识点简述"] || "", // 不在编辑表格里展示这一列（树状图第四层叶子来源），原样透传保存，避免手工编辑时丢失
   }));
   editReadingRows = (c.further_reading || []).map(r => ({
     type: r.type || "", title: r.title || "", url: r.url || "",
@@ -1171,7 +1462,6 @@ function renderCaseEditHTML(c) {
   const to = c.teaching_objectives || {};
   const se = c.sizheng_elements || {};
   const td = c.teaching_design || {};
-  const ev = c.evaluation || {};
   const statusOptions = ["草稿", "待审核", "已采纳", "已驳回"];
   return `
     <div class="inline-row">
@@ -1206,12 +1496,7 @@ function renderCaseEditHTML(c) {
     <label>课中</label><textarea id="edit_td_during" rows="2">${escHtml(td["课中"] || "")}</textarea>
     <label>课后</label><textarea id="edit_td_post" rows="2">${escHtml(td["课后"] || "")}</textarea>
 
-    <div class="section-title">⑥ 课程评价与成效</div>
-    <label>目标达成度</label><textarea id="edit_ev_goal" rows="2">${escHtml(ev["目标达成度"] || "")}</textarea>
-    <label>过程参与度</label><textarea id="edit_ev_participation" rows="2">${escHtml(ev["过程参与度"] || "")}</textarea>
-    <label>教学反思</label><textarea id="edit_ev_reflection" rows="2">${escHtml(ev["教学反思"] || "")}</textarea>
-
-    <div class="section-title">⑦ 延伸阅读</div>
+    <div class="section-title">⑥ 延伸阅读</div>
     <div id="editReadingTable">${renderReadingRowsHTML()}</div>
     <button type="button" class="link-btn" onclick="addReadingRow()">＋ 添加一行</button>
 
@@ -1239,16 +1524,17 @@ function renderCourseRowsHTML() {
 }
 
 function syncCourseRowsFromDOM() {
-  editCourseRows = editCourseRows.map((_, i) => ({
+  editCourseRows = editCourseRows.map((r, i) => ({
     name: document.getElementById(`course_name_${i}`)?.value || "",
     chapter: document.getElementById(`course_chapter_${i}`)?.value || "",
     suggestion: document.getElementById(`course_suggestion_${i}`)?.value || "",
+    kp: r.kp || "", // 没有对应输入框，原样保留
   }));
 }
 
 function addCourseRow() {
   syncCourseRowsFromDOM();
-  editCourseRows.push({ name: "", chapter: "", suggestion: "" });
+  editCourseRows.push({ name: "", chapter: "", suggestion: "", kp: "" });
   document.getElementById("editCoursesTable").innerHTML = renderCourseRowsHTML();
 }
 
@@ -1318,16 +1604,11 @@ async function saveCaseEdit() {
     },
     applicable_courses: editCourseRows
       .filter(r => r.name || r.chapter || r.suggestion)
-      .map(r => ({ "课程名称": r.name, "适用章节": r.chapter, "融入方式建议": r.suggestion })),
+      .map(r => ({ "课程名称": r.name, "适用章节": r.chapter, "融入方式建议": r.suggestion, "知识点简述": r.kp || "" })),
     teaching_design: {
       "课前": document.getElementById("edit_td_pre").value,
       "课中": document.getElementById("edit_td_during").value,
       "课后": document.getElementById("edit_td_post").value,
-    },
-    evaluation: {
-      "目标达成度": document.getElementById("edit_ev_goal").value,
-      "过程参与度": document.getElementById("edit_ev_participation").value,
-      "教学反思": document.getElementById("edit_ev_reflection").value,
     },
     further_reading: editReadingRows
       .filter(r => r.type || r.title || r.url)
@@ -1335,7 +1616,7 @@ async function saveCaseEdit() {
   };
 
   try {
-    const res = await fetch(`${API_BASE}/api/cases/${editingCaseId}`, {
+    const res = await apiFetch(`${API_BASE}/api/cases/${editingCaseId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1356,7 +1637,7 @@ async function exportSelectedCases() {
   const ids = Array.from(selectedCaseIds);
   if (ids.length === 0) { toast("请先勾选要导出的案例"); return; }
   try {
-    const res = await fetch(`${API_BASE}/api/cases/export`, {
+    const res = await apiFetch(`${API_BASE}/api/cases/export`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ case_ids: ids }),
@@ -1380,9 +1661,27 @@ async function exportSelectedCases() {
   }
 }
 
-function exportBook() {
-  toast("正在生成成书Word（前言+按维度分章+附录+知识图谱），下载会在浏览器里弹出");
-  window.open(`${API_BASE}/api/book/export?status=已采纳`, "_blank");
+async function exportBook() {
+  toast("正在生成成书Word（前言+按维度分章+附录+知识图谱），请稍候…");
+  try {
+    const res = await apiFetch(`${API_BASE}/api/book/export?status=已采纳`);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || `导出失败(${res.status})`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "sizheng_case_book.docx";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast("成书Word已导出");
+  } catch (e) {
+    toast("导出出错: " + e.message);
+  }
 }
 
 /* ================= 知识点匹配 ================= */
@@ -1398,7 +1697,7 @@ let editingKnowledgeId = null;
 let _knowledgeSearchDebounceTimer = null;
 
 async function loadKnowledgePoints() {
-  const res = await fetch(`${API_BASE}/api/knowledge/courses`);
+  const res = await apiFetch(`${API_BASE}/api/knowledge/courses`);
   knowledgeCourses = await res.json();
   populateCourseFilter();
   if (knowledgeSearchQuery) {
@@ -1432,7 +1731,7 @@ function onKnowledgeSearchInput(value) {
 }
 
 async function loadKnowledgeSearch(page) {
-  const res = await fetch(`${API_BASE}/api/knowledge?q=${encodeURIComponent(knowledgeSearchQuery)}&page=${page}&page_size=20`);
+  const res = await apiFetch(`${API_BASE}/api/knowledge?q=${encodeURIComponent(knowledgeSearchQuery)}&page=${page}&page_size=20`);
   knowledgeSearchData = await res.json();
   renderKnowledgeList();
 }
@@ -1448,7 +1747,7 @@ async function toggleCourseExpand(courseName) {
 }
 
 async function loadExpandedCourse(courseName, page) {
-  const res = await fetch(`${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}&page=${page}&page_size=20`);
+  const res = await apiFetch(`${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}&page=${page}&page_size=20`);
   expandedCourseData = await res.json();
   renderKnowledgeList();
 }
@@ -1462,7 +1761,7 @@ function changeKnowledgePage(kind, page) {
 /* 增/删/改知识点之后统一走这里刷新：课程名+数量列表，以及当前正打开的那个视图
    （搜索结果 或 展开的课程），不用再手动维护本地缓存的增删改 */
 async function refreshKnowledgeView() {
-  const res = await fetch(`${API_BASE}/api/knowledge/courses`);
+  const res = await apiFetch(`${API_BASE}/api/knowledge/courses`);
   knowledgeCourses = await res.json();
   populateCourseFilter();
   if (knowledgeSearchQuery) {
@@ -1476,7 +1775,7 @@ async function refreshKnowledgeView() {
 
 async function _deleteKnowledgeByCourseRequest(courseName, force) {
   const url = `${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}${force ? "&force=true" : ""}`;
-  const res = await fetch(url, { method: "DELETE" });
+  const res = await apiFetch(url, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok) {
     const err = new Error(data.detail || "删除失败");
@@ -1515,7 +1814,7 @@ async function addKnowledgePointManually() {
   const description = document.getElementById("newKpDescription").value.trim();
   if (!course_name || !description) { toast("课程名称和知识点描述不能为空"); return; }
   try {
-    const res = await fetch(`${API_BASE}/api/knowledge`, {
+    const res = await apiFetch(`${API_BASE}/api/knowledge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ course_name, chapter, description }),
@@ -1633,7 +1932,7 @@ async function saveKnowledgeEdit(id) {
   };
   if (!payload.description) { toast("知识点描述不能为空"); return; }
   try {
-    const res = await fetch(`${API_BASE}/api/knowledge/${id}`, {
+    const res = await apiFetch(`${API_BASE}/api/knowledge/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1650,7 +1949,7 @@ async function saveKnowledgeEdit(id) {
 
 async function _deleteKnowledgePointRequest(id, force) {
   const url = `${API_BASE}/api/knowledge/${id}${force ? "?force=true" : ""}`;
-  const res = await fetch(url, { method: "DELETE" });
+  const res = await apiFetch(url, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok) {
     const err = new Error(data.detail || "删除失败");
@@ -1679,34 +1978,17 @@ async function deleteKnowledgePoint(id) {
   }
 }
 
-async function _unbindKnowledgeMappingRequest(mappingId, force) {
-  const url = `${API_BASE}/api/knowledge_mappings/${mappingId}${force ? "?force=true" : ""}`;
-  const res = await fetch(url, { method: "DELETE" });
-  const data = await res.json();
-  if (!res.ok) {
-    const err = new Error(data.detail || "解绑失败");
-    err.blocked = res.status === 409; // 409：案例的"适用课程举例"里提到了这条知识点，可以选择连同一并删除
-    throw err;
-  }
-  return data;
-}
-
 async function unbindKnowledgeCase(mappingId) {
-  if (!confirm("确定要解绑这条知识点和案例的关联吗？")) return;
+  if (!confirm("确定要解绑这条知识点和案例的关联吗？如果这条之前是「已采纳」状态，解绑后案例的"
+    + "「适用课程举例」「教学设计」会自动重新生成。")) return;
   try {
-    await _unbindKnowledgeMappingRequest(mappingId, false);
-    toast("已解绑");
+    const res = await apiFetch(`${API_BASE}/api/knowledge_mappings/${mappingId}`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "解绑失败");
+    toast(data.enrich_warning ? `已解绑；${data.enrich_warning}` : "已解绑");
     refreshKnowledgeView();
   } catch (e) {
-    if (!e.blocked) { toast("解绑出错: " + e.message); return; }
-    if (!confirm(e.message)) return;
-    try {
-      const data = await _unbindKnowledgeMappingRequest(mappingId, true);
-      toast(`已解绑，同时从「适用课程举例」中删除了 ${data.removed_course_entries} 条相关内容`);
-      refreshKnowledgeView();
-    } catch (e2) {
-      toast("解绑出错: " + e2.message);
-    }
+    toast("解绑出错: " + e.message);
   }
 }
 
@@ -1723,7 +2005,7 @@ async function uploadKnowledgeFiles(files) {
 
   document.getElementById("knowledgeUploadLoading").style.display = "block";
   try {
-    const res = await fetch(`${API_BASE}/api/knowledge/upload`, { method: "POST", body: fd });
+    const res = await apiFetch(`${API_BASE}/api/knowledge/upload`, { method: "POST", body: fd });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "上传失败");
     let msg = `解析完成：${valid.length}个文件，新增 ${data.count} 条知识点`;
@@ -1743,6 +2025,25 @@ function populateMatchCaseSelect() {
   const prevValue = sel.value;
   sel.innerHTML = casesCache.map(c => `<option value="${c.id}">案例${escHtml(c.case_code)}：${escHtml(c.title || "(无标题)")} [${c.status}]</option>`).join("");
   if (prevValue) sel.value = prevValue;
+  loadCaseMappings(sel.value);  // 案例列表刷新后，不管是保留了之前选中项还是默认选中第一个，
+                                // 都要把对应案例已有的匹配记录（含已采纳/已拒绝）加载出来展示
+}
+
+// 加载并展示某个案例已有的全部匹配记录（推荐/已采纳/已拒绝），不触发重新计算——
+// 用于"切换选中的案例"和"打开知识点匹配标签页"两个场景，让人工之前做过的判断
+// 不用重新点一次"运行匹配"就能看到。跟runMatch()是两件事：这个只读取，不计算。
+async function loadCaseMappings(caseId) {
+  currentMatchCaseId = caseId ? parseInt(caseId) : null;
+  if (!caseId) { currentMappings = []; renderMappingTable(); return; }
+  try {
+    const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/knowledge_mappings`);
+    if (!res.ok) throw new Error("加载失败");
+    currentMappings = await res.json();  // 这个GET端点直接返回数组，跟match_knowledge的{mappings:[...]}不一样
+  } catch (e) {
+    toast("加载已有匹配记录出错: " + e.message);
+    currentMappings = [];
+  }
+  renderMappingTable();
 }
 
 async function runMatch() {
@@ -1754,12 +2055,14 @@ async function runMatch() {
   btn.disabled = true;
   loadingEl.style.display = "block";
   try {
-    const res = await fetch(`${API_BASE}/api/cases/${caseId}/match_knowledge`, { method: "POST" });
+    const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/match_knowledge`, { method: "POST" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "匹配失败");
-    currentMappings = data.mappings;
-    renderMappingTable();
-    toast(`匹配完成，共 ${data.mappings.length} 条候选`);
+    toast(`匹配完成，新增 ${data.mappings.length} 条候选`);
+    // 重算只会清空未处理的"推荐"记录、保留已采纳/已拒绝（后端逻辑），这里重新拉取这个
+    // 案例完整的匹配记录来渲染，而不是只用本次响应里新建的这一批，避免把已采纳/已拒绝的
+    // 历史判断从表格里漏掉
+    await loadCaseMappings(caseId);
   } catch (e) {
     toast("匹配出错: " + e.message);
   } finally {
@@ -1771,7 +2074,7 @@ async function runMatch() {
 function renderMappingTable() {
   const el = document.getElementById("mappingTable");
   if (!currentMappings || currentMappings.length === 0) {
-    el.innerHTML = '<div class="empty-hint">选择案例后点击"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div>';
+    el.innerHTML = '<div class="empty-hint">该案例还没有匹配记录，点击上方"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div>';
     return;
   }
   el.innerHTML = `<table>
@@ -1784,7 +2087,7 @@ function renderMappingTable() {
           m.suggestion_text ? escHtml(m.suggestion_text) : '<span style="color:#aaa">点击填写融入方式建议…</span>'
         }</div></td>
         <td>
-          <select id="status_${m.id}" onchange="saveMappingStatus(${m.id})">
+          <select id="status_${m.id}" data-prev-status="${m.status}" onchange="saveMappingStatus(${m.id})">
             <option value="推荐" ${m.status === "推荐" ? "selected" : ""}>推荐</option>
             <option value="已采纳" ${m.status === "已采纳" ? "selected" : ""}>已采纳</option>
             <option value="已拒绝" ${m.status === "已拒绝" ? "selected" : ""}>已拒绝</option>
@@ -1811,7 +2114,7 @@ function openSuggestionEdit(id) {
 async function saveSuggestionEdit(id) {
   const suggestion_text = document.getElementById("suggestionEditArea").value;
   try {
-    const res = await fetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
+    const res = await apiFetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ suggestion_text }),
@@ -1829,9 +2132,15 @@ async function saveSuggestionEdit(id) {
 }
 
 async function saveMappingStatus(id) {
-  const status = document.getElementById(`status_${id}`).value;
+  const select = document.getElementById(`status_${id}`);
+  const status = select.value;
+  // 采纳/取消采纳会触发后端自动重新生成"适用课程举例"/"教学设计"（真实LLM调用），
+  // 不是瞬间完成，禁用一下下拉框、给个提示，避免用户以为卡住了又重复点
+  const isAcceptChange = status === "已采纳" || select.dataset.prevStatus === "已采纳";
+  select.disabled = true;
+  if (isAcceptChange) toast("正在保存并自动生成适用课程举例/教学设计，请稍候…");
   try {
-    const res = await fetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
+    const res = await apiFetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
@@ -1840,9 +2149,12 @@ async function saveMappingStatus(id) {
     if (!res.ok) throw new Error(data.detail || "保存失败");
     const idx = currentMappings.findIndex(m => m.id === id);
     if (idx >= 0) currentMappings[idx] = data;
-    toast("已保存");
+    select.dataset.prevStatus = status;
+    toast(data.enrich_warning ? `已保存；${data.enrich_warning}` : "已保存");
   } catch (e) {
     toast("保存出错: " + e.message);
+  } finally {
+    select.disabled = false;
   }
 }
 
@@ -1856,10 +2168,16 @@ async function enrichCurrentCase() {
 }
 
 /* ================= 初始化 ================= */
-wireDropzone("dropzone", "fileInput", files => uploadFile(files[0]));
-wireDropzone("knowledgeDropzone", "knowledgeFileInput", uploadKnowledgeFiles);
-renderSuggestions();
-loadSessions();
+// 素材/知识点的拖拽上传绑定、建议问题渲染、会话列表加载——这几步涉及真实数据/接口调用，
+// 要等登录校验通过（或AUTH_ENABLED=false测试模式）才执行，不然未登录状态下点按钮会先
+// 收到一堆401报错。登录成功后（doLogin里）会再调用一次这个函数。
+function bootApp() {
+  wireDropzone("dropzone", "fileInput", files => uploadFile(files[0]));
+  wireDropzone("knowledgeDropzone", "knowledgeFileInput", uploadKnowledgeFiles);
+  renderSuggestions();
+  loadSessions();
+}
+checkAuthAndBoot();
 </script>
 </body>
 </html>

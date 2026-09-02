@@ -2,9 +2,11 @@
 把一个案例的七段式内容写入 python-docx 的 Document 对象。
 供「勾选案例导出Word」和「成书编译」两处共用，避免两套导出各写一份格式。
 """
+import io
 import re
 
 from docx.oxml.ns import qn
+from docx.shared import Inches
 
 # 案例正文里的句级引用标注，如 [素材1]、[素材2:关键词片段]（第二种带定位短语，供前端hover预览用）；
 # 导出成Word给人看的最终稿时，这些标注是给内部溯源用的，不应该出现在正式文档里，统一去掉
@@ -31,8 +33,13 @@ def set_default_font(doc, font_name: str = DEFAULT_FONT):
         rpr.rFonts.set(qn("w:eastAsia"), font_name)
 
 
-def write_case_section(doc, case_dict: dict, heading_level: int = 1):
-    """case_dict: Case.to_dict() 的结果"""
+def write_case_section(doc, case_dict: dict, heading_level: int = 1, course_tree_png: bytes | None = None):
+    """case_dict: Case.to_dict() 的结果。
+    course_tree_png: 可选，"适用课程举例"树状图（案例↔课程↔章节↔知识点）预先渲染好的PNG字节
+    ——渲染本身（Playwright起无头浏览器跑mermaid.js）比较慢，同一次导出可能有几十个案例，
+    要在调用方批量渲染一次后逐个传进来，不要在这个函数里每个案例单独渲染一次，见
+    mermaid_render.render_mermaid_batch()。不传或传None就只写文字版表格，不嵌图片
+    （没有适用课程举例数据，或者图渲染失败时就是这种情况，不影响其余内容照常导出）。"""
     d = case_dict
     doc.add_heading(f"案例{d['case_code']}：{d['title'] or ''}", level=heading_level)
     doc.add_paragraph(f"所属维度：{d['dimension'] or ''}　审核状态：{d['status']}")
@@ -72,15 +79,15 @@ def write_case_section(doc, case_dict: dict, heading_level: int = 1):
             cells[1].text = str(row.get("适用章节", ""))
             cells[2].text = str(row.get("融入方式建议", ""))
 
+    if course_tree_png:
+        doc.add_paragraph("知识点关联树状图：")
+        doc.add_picture(io.BytesIO(course_tree_png), width=Inches(6.3))
+
     doc.add_heading("五、教学设计", level=sub)
     for k, v in (d["teaching_design"] or {}).items():
         doc.add_paragraph(f"{k}：{v}")
 
-    doc.add_heading("六、课程评价与成效", level=sub)
-    for k, v in (d["evaluation"] or {}).items():
-        doc.add_paragraph(f"{k}：{v}")
-
-    doc.add_heading("七、延伸阅读", level=sub)
+    doc.add_heading("六、延伸阅读", level=sub)
     for r in (d["further_reading"] or []):
         doc.add_paragraph(f"[{r.get('type', '')}] {r.get('title', '')} {r.get('url', '')}")
 

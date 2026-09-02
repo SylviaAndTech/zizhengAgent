@@ -14,6 +14,8 @@ from book_front_matter import (
 from db import Case, CaseKnowledgeMapping, DIMENSIONS
 from doc_writer import write_case_section, set_default_font
 from knowledge_graph import build_graph, render_graph_png
+from mermaid_tree import build_applicable_courses_mermaid
+from mermaid_render import render_mermaid_batch
 
 # 对应 README 里"五维度固定值，对应大纲第二至六章"的映射关系；"第一章"是前面
 # 新增的"课程思政元素与知识图谱总览"，这里从"第二章"起刚好接上，不用挪号
@@ -98,6 +100,14 @@ def build_book_docx(db, status_filter: str = "已采纳") -> bytes:
     for c in cases:
         by_dimension[c.dimension].append(c)
 
+    # 树状图渲染（起无头浏览器）比较慢，全书可能有几十个案例，这里对所有案例只批量渲染
+    # 一次，不要在下面的分章节循环里逐个案例单独渲染
+    case_dicts = {c.id: c.to_dict() for c in cases}
+    tree_pngs = dict(zip(
+        case_dicts.keys(),
+        render_mermaid_batch([build_applicable_courses_mermaid(case_dicts[cid]) for cid in case_dicts]),
+    ))
+
     for dim in DIMENSIONS:
         chapter_title = CHAPTER_TITLES.get(dim, dim)
         subtitle = CHAPTER_SUBTITLES.get(dim)
@@ -107,7 +117,7 @@ def build_book_docx(db, status_filter: str = "已采纳") -> bytes:
             doc.add_paragraph(f"（{dim}维度暂无「{status_filter}」状态的案例）")
             continue
         for c in dim_cases:
-            write_case_section(doc, c.to_dict(), heading_level=2)
+            write_case_section(doc, case_dicts[c.id], heading_level=2, course_tree_png=tree_pngs.get(c.id))
 
     doc.add_heading("附录一 案例总览表", level=1)
     _write_case_overview_table(doc, cases)
