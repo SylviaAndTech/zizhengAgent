@@ -1,0 +1,67 @@
+# 应用层：api + web。这层随每次发版更新，跟数据层（infra/docker-compose.yml）分开，
+# 发布时只在这个目录操作，不碰数据库容器。
+#
+# 部署/更新：
+#   cd app
+#   export TAG=<git-sha>           # 或不设，默认 latest
+#   docker compose pull            # 拉 GitHub Actions 构建好的新镜像
+#   docker compose up -d --force-recreate
+#
+# 【为什么用 --force-recreate 而不是普通的 up -d】
+# nginx 在加载配置时就把 api 这个主机名解析成 IP 并永久缓存（见 deploy/nginx.conf 里的说明）。
+# 如果只重建 api、web 保持不动，api 拿到新 IP 后 nginx 还在往旧 IP 发请求，会持续 502 直到
+# web 重启——实测复现过。--force-recreate 让两个容器一起重建，nginx 重新解析，规避这个问题。
+# 代价是有几秒钟的中断，对这个内部使用的系统可以接受。
+#
+# 回滚到上一个版本：TAG=<上一个 git-sha> docker compose up -d --force-recreate
+
+services:
+  api:
+    # TAG 默认 latest；发版/回滚时用 TAG=<commit-sha> 精确指定，
+    # 比"重新 pull latest"更可控——latest 会随下一次构建漂移，sha 是不可变的
+    image: ccr.ccs.tencentyun.com/ideological/sizheng-api:${TAG:-latest}
+    container_name: sizheng-api
+    restart: always
+    env_file:
+      - .env
+    healthcheck:
+      # 打容器内的 /health（不经过 nginx，所以不带 /api 前缀）。
+      # 用 python 而不是 curl：python 一定存在（这就是个 python 镜像），
+      # 不用为了健康检查额外 apt install curl 把镜像撑大
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      # 后端启动要 import 一大堆重依赖（langchain/llama-index/chromadb）再建表，
+      # 冷启动几十秒很正常，给足宽限期免得刚起来就被判失败反复重启
+      start_period: 90s
+    networks:
+      - appnet
+    # 不映射 ports：外部流量一律走 web(nginx) 进来，api 只在内网可达。
+    # 这样鉴权、限流、TLS 全部收敛在 nginx 一层，没有绕过它直连后端的路径
+
+  web:
+    image: ccr.ccs.tencentyun.com/ideological/sizheng-web:${TAG:-latest}
+    container_name: sizheng-web
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # 证书从宿主机挂进来（只读）。路径要跟 deploy/nginx.conf 里写死的
+      # /etc/nginx/certs/fullchain.crt 和 private.key 对上。
+      # :ro 是因为 nginx 只需要读证书，挂成只读能减少证书被容器内进程篡改的风险
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      api:
+        # 等 api 真正健康了再起 nginx。虽然 nginx 起早了也只是 502（不会崩），
+        # 但等一下能避免刚部署完那几十秒里用户看到报错页
+        condition: service_healthy
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    # 由 `docker network create appnet` 手动创建，跟 infra 那套容器共用，
+    # api 才能用 mysql / chroma 这两个服务名连上数据库
+    external: true

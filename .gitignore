@@ -4,3 +4,18 @@ backend/__pycache__/
 backend/sizheng_cases.db
 *.pyc
 .DS_Store
+
+# 容器数据卷（绑定挂载）：生产数据和本地验证数据都不进版本控制
+data/
+.local-data/
+volumes/
+
+# 各层 compose 的实际配置（含密码），只提交 .env.example 模板
+app/.env
+infra/.env
+
+# TLS 证书私钥，绝不能进版本控制
+app/certs/
+*.crt
+*.key
+*.pem

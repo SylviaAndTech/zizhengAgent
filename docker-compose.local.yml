@@ -1,0 +1,107 @@
+# 本地开发验证用：把生产上分成两套的四个服务合并到一个文件，一条命令跑起完整链路。
+#
+#   docker compose -f docker-compose.local.yml up -d --build
+#   访问 http://localhost:8080
+#
+# 跟生产的差异（都是有意为之）：
+#  - mysql/chroma 用 Docker Hub 官方镜像（本地能直连，不用先往 TCR 转推）
+#  - api/web 用 build 本地构建，改完代码重新 build 就能验证，不用等 CI 推镜像
+#  - web 只开 8080:80、走不含 SSL 的 nginx.local.conf（本地自签证书浏览器会拦，徒增摩擦）
+#  - 网络不是 external：本地不用手动 docker network create，compose 自己建
+#  - 数据落在 .local-data/（已加进 .gitignore），跟生产的 data/ 分开，随时可以删了重来
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: local-sizheng-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: local_root_pass
+      MYSQL_DATABASE: sizheng_cases
+      MYSQL_USER: sizheng
+      MYSQL_PASSWORD: local_app_pass
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+      - --innodb-buffer-pool-size=256M
+    volumes:
+      - ./.local-data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-plocal_root_pass"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  chroma:
+    image: chromadb/chroma:1.5.9
+    container_name: local-sizheng-chroma
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /data
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - ./.local-data/chroma:/data
+    healthcheck:
+      # 同 infra 里的说明：这个镜像没有 curl/wget，v1 API 已废弃，用 bash 的 /dev/tcp 打 v2 心跳
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /api/v2/heartbeat HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && head -1 <&3 | grep -q '200 OK'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  api:
+    build:
+      # 构建上下文是仓库根目录，跟 CI 里保持一致，这样 Dockerfile 里的 COPY backend/... 路径通用
+      context: .
+      dockerfile: Dockerfile.api
+      args:
+        # 本地在国内网络下构建，apt 走阿里云源，否则 Debian 官方源慢到几乎装不上。
+        # CI 里不传这个参数，用的还是官方源——所以本地和 CI 共用同一份 Dockerfile，
+        # 不需要构建前改一次、推代码前再改回去
+        APT_MIRROR: mirrors.tuna.tsinghua.edu.cn
+    container_name: local-sizheng-apis
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: sizheng
+      DB_PASSWORD: local_app_pass
+      DB_NAME: sizheng_cases
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"     # 容器内 chroma 实际监听 8000，不是本地映射的 8001
+      AUTH_ENABLED: "true"    # 保持 true，本地才能验证鉴权确实生效（这正是这次要回归的重点）
+      AUTH_DEFAULT_ADMIN_PASSWORD: ${AUTH_DEFAULT_ADMIN_PASSWORD:-admin123456}
+      # 大模型 key 从宿主机环境变量透传，不写死在文件里避免误提交。
+      # 没设也能起来，只是所有要调模型的功能会报错，不影响验证部署链路本身
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: local-sizheng-web
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      # 用不含 SSL 的配置覆盖镜像里那份生产配置。挂载而不是重新构建镜像，
+      # 是为了让本地和生产共用同一个 Dockerfile.web，不搞两套构建
+      - ./deploy/nginx.local.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy

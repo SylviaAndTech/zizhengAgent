@@ -1,0 +1,17 @@
+# 前端镜像。
+#
+# 【为什么是单阶段、没有 node 构建阶段】
+# 这个项目的前端是一个纯静态的单文件 frontend/index.html（无框架、无打包），
+# 整个仓库里没有 package.json、没有 vite/webpack 配置，也就没有任何构建产物要生成。
+# 硬套多阶段构建只会白白拉一个 node:20-alpine 镜像然后什么也不做，所以直接单阶段
+# 复制进 nginx。将来前端如果改造成需要构建的框架项目，再在这里补第一阶段。
+FROM nginx:1.27-alpine
+
+# 静态页面
+COPY frontend/index.html /usr/share/nginx/html/index.html
+
+# nginx 站点配置（含 /api 反代规则）。证书不在这里 COPY——证书是环境相关的机密，
+# 打进镜像既不安全、也会导致换证书就得重新构建；改成 compose 里挂载进来。
+COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80 443
