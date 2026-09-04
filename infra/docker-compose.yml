@@ -1,0 +1,72 @@
+# 数据层：MySQL + ChromaDB。这层很少变动，跟频繁更新的应用层（app/docker-compose.yml）分开管理，
+# 这样发新版本时只需要在 app/ 目录下 pull+up，完全不碰数据库容器，避免误重启导致业务中断。
+#
+# 启动：先建外部网络（只需一次）  docker network create appnet
+#      再  cd infra && docker compose up -d
+
+services:
+  mysql:
+    # 官方镜像转推到腾讯云 TCR，服务器拉取更快也更稳（不受 Docker Hub 限流影响）
+    image: ccr.ccs.tencentyun.com/ideological/mysql:8.0
+    container_name: sizheng-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      # utf8mb4 必须显式指定：案例正文里有大量中文，还可能有 emoji，
+      # 用 utf8（实际是 utf8mb3）存 4 字节字符会直接报错或丢字
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # 让 MySQL 内部时间函数也用东八区，跟容器 TZ 保持一致，避免日志/时间戳差 8 小时
+      - --default-time-zone=+08:00
+      # 不设的话 MySQL 会按宿主机可见内存自动放大（实测能占到 ~480MB），
+      # 这个项目数据量很小，256M 足够，给应用和向量库留出内存
+      - --innodb-buffer-pool-size=256M
+    volumes:
+      # 绑定挂载而不是 named volume：数据落在宿主机 ./data/mysql 下看得见摸得着，
+      # 备份就是直接 tar 这个目录，不用 docker volume 那套命令
+      - ../data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - appnet
+    # 不映射 ports：只有同一个 appnet 网络里的容器需要访问，
+    # 暴露到宿主机等于给公网多开一个攻击面。需要本机调试时临时加 "127.0.0.1:3306:3306"
+
+  chroma:
+    image: ccr.ccs.tencentyun.com/ideological/chroma:1.5.9
+    container_name: sizheng-chroma
+    restart: always
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /data
+      ANONYMIZED_TELEMETRY: "FALSE"
+      TZ: Asia/Shanghai
+    volumes:
+      - ../data/chroma:/data
+    healthcheck:
+      # chroma 镜像里没有 curl 也没有 wget（实测确认过），只有 bash，所以用 bash 的 /dev/tcp
+      # 手搓一个最简 HTTP 请求；另外这个版本的 v1 API 已经返回 410 Gone，必须打 v2 的心跳路径
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /api/v2/heartbeat HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && head -1 <&3 | grep -q '200 OK'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - appnet
+    # 同样不映射 ports。注意容器内 chroma 监听的是 8000，
+    # 所以应用侧的 CHROMA_PORT 要填 8000（不是本地开发时常用的 8001）
+
+networks:
+  appnet:
+    # external：这个网络由 `docker network create appnet` 手动创建，两个 compose 共用它来互通。
+    # 不写 external 的话每个 compose 会各自建一个带项目名前缀的网络，api 就找不到 mysql/chroma 了
+    external: true

@@ -20,19 +20,21 @@ from sqlalchemy.orm import Session
 
 from db import (
     init_db, get_db, SessionLocal, RawMaterial, Case, CaseMaterial, DIMENSIONS,
-    KnowledgePoint, CaseKnowledgeMapping, ChatSession, CaseAuditLog, User,
-    allocate_case_version_code,
+    KnowledgePoint, CaseKnowledgeMapping, ChatSession, CaseAuditLog, User, BackgroundJob,
 )
 from auth import (
     AUTH_ENABLED, DEFAULT_ADMIN_USERNAME, verify_password,
     create_session_token, get_user_from_token, delete_session_token,
 )
 from fetch_material import fetch_url_text
-from generate_case import generate_case_draft
 from parse_document import parse_uploaded_document
 from knowledge_matching import (
-    extract_knowledge_points, match_case_to_knowledge, index_knowledge_point,
-    reindex_knowledge_point, remove_knowledge_point_from_index, enrich_case_from_accepted_mappings,
+    extract_knowledge_points, index_knowledge_point,
+    reindex_knowledge_point, remove_knowledge_point_from_index,
+)
+from job_queue import (
+    submit_generate_job, submit_match_knowledge_job, submit_enrich_job,
+    reset_stale_jobs_on_startup,
 )
 from chat_agent import stream_chat
 from audit import log_case_change
@@ -45,28 +47,41 @@ from material_index import index_material
 
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="思政案例生成工作台 - 原型")
+# root_path="/api"：生产环境 nginx 用 `proxy_pass http://api:8000/`（末尾带斜杠）把 /api 前缀
+# 剥掉之后才转发过来，所以本应用的路由都注册成不带 /api 的路径（比如 /cases）。
+# root_path 不参与路由匹配，只告诉 FastAPI"我实际被挂在 /api 下面"，让 Swagger/OpenAPI 生成的
+# 请求地址带上这个前缀——不设的话 /api/docs 能打开，但页面里 Try it out 会打到 /cases（少了
+# /api），直接 404。
+app = FastAPI(title="思政案例生成工作台 - 原型", root_path=os.environ.get("ROOT_PATH", "/api"))
 
-# ---------- 登录鉴权：所有/api/*接口默认都要求登录，登录本身这个接口除外 ----------
+# ---------- 登录鉴权：默认全部接口都要求登录，只有白名单里的放行 ----------
 # AUTH_ENABLED=false（.env里配）可以整体关掉这层校验，方便测试阶段不用每次都登录；
 # 上线前要确认.env里这个开关是打开的（默认就是true，不用特意配也行）。
 #
-# 这个中间件必须在下面app.add_middleware(CORSMiddleware...)之前注册——Starlette的中间件栈是
-# "后注册的在最外层"，如果CORS中间件先注册、auth中间件后注册，auth中间件会被包在CORS外面，
-# 它直接返回的401 JSONResponse就不会经过CORS中间件处理、不会带Access-Control-Allow-Origin
-# 响应头。前端(:5500)跨源请求受保护接口时，浏览器看到没有CORS头的401会直接判定为CORS错误、
-# 把响应体和状态码都藏起来不让JS读到，导致前端apiFetch()里"检查res.status===401"这行代码
-# 永远走不到（fetch()的promise会在CORS阶段就reject掉）。实测验证过这个顺序错了会复现这个问题，
-# 调换成现在这个顺序（auth先注册、在内层；CORS后注册、在外层）之后401响应能正确带上CORS头。
-_PUBLIC_API_PATHS = {"/api/auth/login"}
+# 【为什么是白名单而不是按路径前缀判断】
+# 旧写法是 `not path.startswith("/api/") -> 放行`。那套逻辑依赖"所有业务接口都在 /api/ 下"，
+# 一旦放到 nginx 后面、前缀被剥掉，后端收到的路径全都不以 /api/ 开头，于是每个请求都命中放行
+# 分支——整站鉴权直接失效、所有接口变成匿名可访问。改成"默认拦、白名单放行"之后是 fail-closed 的：
+# 将来新增接口忘了配也只会变成"需要登录"，而不是"意外公开"。
+# 白名单同时写了带前缀和不带前缀两种形式：不带前缀是生产（nginx 剥掉后）的实际路径，带前缀是
+# 本地直连 uvicorn 调试时的路径，两种跑法都能正常登录。
+_PUBLIC_PATHS = {
+    "/auth/login", "/api/auth/login",     # 登录接口本身，不能要求先登录
+    "/health", "/api/health",             # 容器 healthcheck，不带凭证
+    "/", "/api/",                         # 根路径的存活检查
+    "/docs", "/api/docs", "/redoc", "/api/redoc",
+    "/openapi.json", "/api/openapi.json",
+}
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if not AUTH_ENABLED:
         return await call_next(request)
-    path = request.url.path
-    if request.method == "OPTIONS" or not path.startswith("/api/") or path in _PUBLIC_API_PATHS:
+    # 用 scope["path"] 而不是 url.path：两者在有 root_path 时含义可能不同，scope["path"] 始终是
+    # 应用实际用来匹配路由的那个路径，跟白名单比对才不会错位
+    path = request.scope.get("path", request.url.path)
+    if request.method == "OPTIONS" or path in _PUBLIC_PATHS:
         return await call_next(request)
     auth_header = request.headers.get("Authorization", "")
     token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
@@ -81,18 +96,30 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# 默认只放开本机常用的静态服务端口；部署到其他地址时通过 CORS_ORIGINS（逗号分隔）覆盖
-_default_origins = "http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000"
-CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", _default_origins).split(",") if o.strip()]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 【CORS 默认关闭】生产环境 nginx 把前端静态页和 /api 反代放在同一个 origin 下，浏览器视角下
+# 前后端同源，压根不需要 CORS。所以这里改成"只有显式设置了 CORS_ORIGINS 环境变量才注册这个
+# 中间件"——生产不设=零 CORS 开销，也不会因为配错白名单把接口暴露给别的站点。
+# 保留这个开关是为了本地开发时可以不走 nginx、直接 uvicorn + 另起一个静态服务器调试，
+# 那种跑法是跨源的，设一下 CORS_ORIGINS 就能用。
+#
+# 注册顺序有讲究：必须在上面 auth 中间件之后注册（Starlette 是"后注册的在更外层"），这样
+# auth 返回的 401 才会经过 CORS 中间件、带上 Access-Control-Allow-Origin 头。否则跨源场景下
+# 浏览器会把没有 CORS 头的 401 判成 CORS 错误，连状态码都不给 JS 读，前端就没法识别"要重新登录"。
+_cors_origins_env = os.environ.get("CORS_ORIGINS", "").strip()
+if _cors_origins_env:
+    CORS_ORIGINS = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.info(f"已启用 CORS，允许的来源: {CORS_ORIGINS}")
 
 init_db()
+# 后台任务是进程内线程池跑的，进程一重启就都没了；把数据库里还停在pending/running的旧任务
+# 标记成失败，免得前端轮询到一个永远不会变的"进行中"
+reset_stale_jobs_on_startup()
 # ChromaDB/LlamaIndex 的连接是懒加载的（第一次真正建索引/检索时才连），
 # 这里不用单独预热，连不上也不会拖垮后端启动，只会在用到时报错。
 
@@ -102,7 +129,7 @@ class LoginRequest(BaseModel):
     password: str
 
 
-@app.post("/api/auth/login")
+@app.post("/auth/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == req.username, User.is_active.is_(True)).first()
     if not user or not verify_password(req.password, user.password_hash):
@@ -111,7 +138,7 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     return {"token": token, "username": user.username}
 
 
-@app.post("/api/auth/logout")
+@app.post("/auth/logout")
 def logout(request: Request, db: Session = Depends(get_db)):
     auth_header = request.headers.get("Authorization", "")
     token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
@@ -119,7 +146,7 @@ def logout(request: Request, db: Session = Depends(get_db)):
     return {"logged_out": True}
 
 
-@app.get("/api/auth/me")
+@app.get("/auth/me")
 def get_me(request: Request):
     if not AUTH_ENABLED:
         return {"username": DEFAULT_ADMIN_USERNAME, "auth_disabled": True}
@@ -178,7 +205,7 @@ class CreateKnowledgePointRequest(BaseModel):
 
 # ---------- 素材相关接口 ----------
 
-@app.post("/api/materials/import")
+@app.post("/materials/import")
 def import_materials(req: ImportMaterialsRequest, db: Session = Depends(get_db)):
     """批量导入URL并抓取正文，落盘存档；同一案例下已经存过的URL不会重复入库"""
     results = []
@@ -235,7 +262,7 @@ def _save_upload_to_tempfile(file: UploadFile, filename: str) -> str:
         return tmp.name
 
 
-@app.post("/api/materials/upload")
+@app.post("/materials/upload")
 def upload_material(
     case_code: str = Form(...),
     file: UploadFile = File(...),
@@ -300,7 +327,7 @@ def _material_to_dict(m: RawMaterial) -> dict:
     }
 
 
-@app.get("/api/materials")
+@app.get("/materials")
 def list_materials(
     case_code: str | None = None, q: str | None = None, db: Session = Depends(get_db)
 ):
@@ -345,7 +372,7 @@ def _compute_next_case_code(case_codes: list[str]) -> str | None:
     return ".".join(parts)
 
 
-@app.get("/api/materials/case_codes")
+@app.get("/materials/case_codes")
 def list_material_case_codes(db: Session = Depends(get_db)):
     """素材库里已经出现过的案例编号（供前端做筛选下拉），外加一个建议的"下一个案例编号"默认值"""
     rows = db.query(RawMaterial.case_code).distinct().all()
@@ -353,7 +380,7 @@ def list_material_case_codes(db: Session = Depends(get_db)):
     return {"case_codes": codes, "next_case_code": _compute_next_case_code(codes)}
 
 
-@app.delete("/api/materials/{material_id}")
+@app.delete("/materials/{material_id}")
 def delete_material(material_id: int, db: Session = Depends(get_db)):
     """删除一条素材；同时清掉它在案例证据链里的关联记录"""
     material = db.query(RawMaterial).filter(RawMaterial.id == material_id).first()
@@ -367,14 +394,18 @@ def delete_material(material_id: int, db: Session = Depends(get_db)):
 
 # ---------- 案例生成/审核相关接口 ----------
 
-@app.get("/api/dimensions")
+@app.get("/dimensions")
 def get_dimensions():
     return DIMENSIONS
 
 
-@app.post("/api/cases/generate")
-def generate_case(req: GenerateCaseRequest, db: Session = Depends(get_db)):
-    """根据选定的素材，调用LLM生成7段式案例草稿"""
+@app.post("/cases/generate", status_code=202)
+def generate_case(req: GenerateCaseRequest, request: Request, db: Session = Depends(get_db)):
+    """提交一个案例生成任务，立刻返回job_id，不等生成跑完。
+
+    案例正文要走writer/judge/reviser评审循环，通常5-20分钟，同步等待会把成败绑死在这条
+    HTTP连接上（断线/刷新就再也拿不到结果）。这里只做参数校验+入队，实际生成在
+    job_queue的线程池里跑，调用方之后轮询 GET /api/jobs/{job_id} 看进度。"""
     materials = (
         db.query(RawMaterial)
         .filter(RawMaterial.id.in_(req.material_ids))
@@ -389,45 +420,15 @@ def generate_case(req: GenerateCaseRequest, db: Session = Depends(get_db)):
             400, "所选素材均抓取失败，没有可供生成的真实内容，请先补充有效素材"
         )
 
-    material_payload = [
-        {"id": m.id, "url": m.url, "title": None, "text": m.fetched_text}
-        for m in success_materials
-    ]
-
-    try:
-        draft = generate_case_draft(req.case_code, material_payload)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"生成失败: {str(e)}")
-
-    case = Case(
-        case_code=allocate_case_version_code(db, req.case_code),
-        dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
-        title=draft.get("title"),
-        full_narrative=draft.get("full_narrative"),
-        full_narrative_draft=draft.get("full_narrative_draft"),
-        teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
-        sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
-        # 适用课程举例/教学设计不在初次生成时产出了，等知识点匹配采纳后才会有内容，
-        # 这里留空（真正的NULL，不是json.dumps(None)的字符串"null"）
-        applicable_courses=None,
-        teaching_design=None,
-        further_reading=json.dumps(draft.get("further_reading"), ensure_ascii=False),
-        status="待审核",
+    user = getattr(request.state, "user", None)
+    job_id = submit_generate_job(
+        req.case_code, [m.id for m in success_materials],
+        requested_by=user.id if user else None,
     )
-    db.add(case)
-    db.commit()
-    db.refresh(case)
-
-    for m in success_materials:
-        db.add(CaseMaterial(case_id=case.id, material_id=m.id))
-    db.commit()
-
-    return case.to_dict()
+    return {"job_id": job_id, "message": "已提交生成任务，预计5-20分钟，可轮询任务状态查看进度"}
 
 
-@app.get("/api/cases")
+@app.get("/cases")
 def list_cases(case_code: str | None = None, db: Session = Depends(get_db)):
     query = db.query(Case)
     if case_code:
@@ -436,7 +437,7 @@ def list_cases(case_code: str | None = None, db: Session = Depends(get_db)):
     return [c.to_dict() for c in cases]
 
 
-@app.get("/api/cases/{case_id}")
+@app.get("/cases/{case_id}")
 def get_case(case_id: int, db: Session = Depends(get_db)):
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
@@ -444,7 +445,7 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
     return case.to_dict()
 
 
-@app.get("/api/cases/{case_id}/materials")
+@app.get("/cases/{case_id}/materials")
 def get_case_materials(case_id: int, db: Session = Depends(get_db)):
     """案例正文里的[素材N:定位短语]引用标注，N是生成时素材的排列序号；这里按当初关联的顺序
     （CaseMaterial.id升序，即生成时插入的先后顺序）把素材原文一并返回，前端才能在hover时
@@ -472,7 +473,7 @@ def get_case_materials(case_id: int, db: Session = Depends(get_db)):
     return {"materials": materials}
 
 
-@app.put("/api/cases/{case_id}")
+@app.put("/cases/{case_id}")
 def update_case(case_id: int, req: UpdateCaseRequest, db: Session = Depends(get_db)):
     """人工编辑/审核通过案例"""
     case = db.query(Case).filter(Case.id == case_id).first()
@@ -495,7 +496,7 @@ def update_case(case_id: int, req: UpdateCaseRequest, db: Session = Depends(get_
     return case.to_dict()
 
 
-@app.delete("/api/cases/{case_id}")
+@app.delete("/cases/{case_id}")
 def delete_case(case_id: int, db: Session = Depends(get_db)):
     """删除一个案例；连带清掉它的证据链关联、知识点关联建议、修改记录，避免留下悬空外键"""
     case = db.query(Case).filter(Case.id == case_id).first()
@@ -509,7 +510,7 @@ def delete_case(case_id: int, db: Session = Depends(get_db)):
     return {"deleted": True}
 
 
-@app.get("/api/cases/{case_id}/audit_log")
+@app.get("/cases/{case_id}/audit_log")
 def get_case_audit_log(case_id: int, db: Session = Depends(get_db)):
     """查看某个案例的修改记录：谁在什么时候改了哪些字段"""
     logs = (
@@ -521,7 +522,7 @@ def get_case_audit_log(case_id: int, db: Session = Depends(get_db)):
     return [log.to_dict() for log in logs]
 
 
-@app.post("/api/cases/export")
+@app.post("/cases/export")
 def export_cases(req: ExportCasesRequest, db: Session = Depends(get_db)):
     """把勾选的案例按七段式结构拼装成一份 Word 文档，供下载"""
     cases = (
@@ -555,7 +556,7 @@ def export_cases(req: ExportCasesRequest, db: Session = Depends(get_db)):
 
 # ---------- AI 助手（agent对话，替代原来的案例工作台手动编辑） ----------
 
-@app.get("/api/chat/sessions")
+@app.get("/chat/sessions")
 def list_chat_sessions(db: Session = Depends(get_db)):
     """会话列表，按最近更新排序，供左侧栏展示历史记录"""
     sessions = db.query(ChatSession).order_by(ChatSession.updated_at.desc()).all()
@@ -570,7 +571,7 @@ def list_chat_sessions(db: Session = Depends(get_db)):
     ]
 
 
-@app.post("/api/chat/sessions")
+@app.post("/chat/sessions")
 def create_chat_session(db: Session = Depends(get_db)):
     session = ChatSession(title="新对话", messages="[]")
     db.add(session)
@@ -579,7 +580,7 @@ def create_chat_session(db: Session = Depends(get_db)):
     return session.to_dict()
 
 
-@app.get("/api/chat/sessions/{session_id}")
+@app.get("/chat/sessions/{session_id}")
 def get_chat_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if not session:
@@ -587,7 +588,7 @@ def get_chat_session(session_id: int, db: Session = Depends(get_db)):
     return session.to_dict()
 
 
-@app.delete("/api/chat/sessions/{session_id}")
+@app.delete("/chat/sessions/{session_id}")
 def delete_chat_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if not session:
@@ -597,7 +598,7 @@ def delete_chat_session(session_id: int, db: Session = Depends(get_db)):
     return {"deleted": True}
 
 
-@app.post("/api/chat")
+@app.post("/chat")
 def chat(req: ChatSendRequest, db: Session = Depends(get_db)):
     """给指定会话追加一条用户消息，以SSE流式推送AI助手逐token生成的回复；
     流结束时（事件类型done）把完整历史落回这个会话，同一条SSE事件里带上刷新后的session，
@@ -640,7 +641,7 @@ def chat(req: ChatSendRequest, db: Session = Depends(get_db)):
 
 # ---------- 知识点抽取与案例-知识点匹配 ----------
 
-@app.post("/api/knowledge/upload")
+@app.post("/knowledge/upload")
 def upload_knowledge(
     files: list[UploadFile] = File(...),
     course_name: str = Form(""),
@@ -731,7 +732,7 @@ def upload_knowledge(
     }
 
 
-@app.get("/api/knowledge")
+@app.get("/knowledge")
 def list_knowledge(
     course_name: str | None = None,
     q: str | None = None,
@@ -792,7 +793,7 @@ def list_knowledge(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
-@app.get("/api/knowledge/courses")
+@app.get("/knowledge/courses")
 def list_knowledge_courses(db: Session = Depends(get_db)):
     """课程名+各自知识点数量，给知识点库折叠列表的课程标题行用——不用为了拿这份清单
     去加载全部知识点正文"""
@@ -805,7 +806,7 @@ def list_knowledge_courses(db: Session = Depends(get_db)):
     return [{"course_name": name, "count": count} for name, count in rows]
 
 
-@app.post("/api/knowledge")
+@app.post("/knowledge")
 def create_knowledge_point(req: CreateKnowledgePointRequest, db: Session = Depends(get_db)):
     """手动添加一条知识点，跟批量上传大纲解析出来的条目走同一张表，只是来源不是文件解析"""
     course_name = req.course_name.strip()
@@ -868,7 +869,7 @@ def _blocking_mappings_detail(db: Session, point_ids: list[int]) -> str | None:
     )
 
 
-@app.delete("/api/knowledge")
+@app.delete("/knowledge")
 def delete_knowledge_by_course(course_name: str, force: bool = False, db: Session = Depends(get_db)):
     """删掉一门课程下的全部知识点（连带向量索引），用于整门课程的大纲要重新导入或者传错课程了的场景。
     force=True 时，如果知识点被某个案例的知识点关联引用着，连同这些关联记录一并删除
@@ -910,7 +911,7 @@ def delete_knowledge_by_course(course_name: str, force: bool = False, db: Sessio
     return {"deleted": True, "count": len(point_ids), "removed_mappings": removed_mappings}
 
 
-@app.put("/api/knowledge/{point_id}")
+@app.put("/knowledge/{point_id}")
 def update_knowledge_point(point_id: int, req: UpdateKnowledgePointRequest, db: Session = Depends(get_db)):
     """人工修正一条知识点（抽取难免有错，特别是扫描件OCR来的）；描述改了要重新建索引，
     不然向量检索命中的还是修改前的旧文本"""
@@ -937,7 +938,7 @@ def update_knowledge_point(point_id: int, req: UpdateKnowledgePointRequest, db: 
     }
 
 
-@app.delete("/api/knowledge/{point_id}")
+@app.delete("/knowledge/{point_id}")
 def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Depends(get_db)):
     """force=True 时，如果这条知识点被某个案例的知识点关联引用着，连同这条关联记录一并删除"""
     kp = db.query(KnowledgePoint).filter(KnowledgePoint.id == point_id).first()
@@ -970,11 +971,13 @@ def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Dep
     return {"deleted": True, "removed_mappings": removed_mappings}
 
 
-@app.post("/api/cases/{case_id}/match_knowledge")
-def match_knowledge(case_id: int, db: Session = Depends(get_db)):
-    """
-    对已审核/草稿案例，跑一遍与知识点库的匹配：向量+关键词混合粗筛 + Qwen复核精排，生成候选关联建议
-    """
+@app.post("/cases/{case_id}/match_knowledge", status_code=202)
+def match_knowledge(case_id: int, request: Request, db: Session = Depends(get_db)):
+    """提交一个知识点匹配任务（向量+关键词混合粗筛 + LLM复核精排），立刻返回job_id。
+
+    实际匹配在后台线程池里跑，完成后结果直接写进case_knowledge_mappings表；调用方轮询到
+    这个job变成done之后，用 GET /api/cases/{case_id}/knowledge_mappings 读结果即可
+    （不在任务表里重复存一份匹配结果）。"""
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
         raise HTTPException(404, "案例不存在")
@@ -982,39 +985,34 @@ def match_knowledge(case_id: int, db: Session = Depends(get_db)):
     if db.query(KnowledgePoint).count() == 0:
         raise HTTPException(400, "还没有导入任何知识点，请先在「知识点匹配」标签页上传课程教学大纲")
 
-    try:
-        matches = match_case_to_knowledge(db, case)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    # match_case_to_knowledge内部可能顺带生成/刷新了case.topic_keywords（向量检索查询文本
-    # 的缓存，懒生成+按正文内容哈希失效），这里落库；不是用户可见的内容变更，不写审计日志
-    db.commit()
-
-    # 清空旧的"推荐"记录避免重复堆积；已人工采纳/拒绝的决定予以保留
-    db.query(CaseKnowledgeMapping).filter(
-        CaseKnowledgeMapping.case_id == case_id,
-        CaseKnowledgeMapping.status == "推荐",
-    ).delete()
-    db.commit()
-
-    created = []
-    for m in matches:
-        mapping = CaseKnowledgeMapping(
-            case_id=case_id,
-            knowledge_point_id=m["knowledge_point"].id,
-            relevance_score=m["relevance_score"],
-            suggestion_text=m["suggestion_text"],
-            status="推荐",
-        )
-        db.add(mapping)
-        db.commit()
-        db.refresh(mapping)
-        created.append(mapping.to_dict())
-    return {"mappings": created}
+    user = getattr(request.state, "user", None)
+    job_id = submit_match_knowledge_job(case_id, requested_by=user.id if user else None)
+    return {"job_id": job_id, "message": "已提交匹配任务，完成后候选列表会自动刷新"}
 
 
-@app.get("/api/cases/{case_id}/knowledge_mappings")
+@app.get("/jobs")
+def list_jobs(status: str = "pending,running", limit: int = 20, db: Session = Depends(get_db)):
+    """列出后台任务，默认只列还在进行中的（前端每隔几秒轮询这个接口刷新顶部进度条）。
+    status可以传逗号分隔的多个状态，比如 "pending,running" 或 "done,failed"。
+    不带result_case完整内容——轮询很频繁，案例正文两三千字，每次都带上纯属浪费带宽。"""
+    wanted = [s.strip() for s in status.split(",") if s.strip()]
+    query = db.query(BackgroundJob)
+    if wanted:
+        query = query.filter(BackgroundJob.status.in_(wanted))
+    jobs = query.order_by(BackgroundJob.created_at.desc()).limit(limit).all()
+    return [j.to_dict() for j in jobs]
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: int, db: Session = Depends(get_db)):
+    """查单个后台任务的状态。done的生成任务会带上完整的result_case内容。"""
+    job = db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    return job.to_dict(include_result_case=True)
+
+
+@app.get("/cases/{case_id}/knowledge_mappings")
 def get_knowledge_mappings(case_id: int, db: Session = Depends(get_db)):
     mappings = (
         db.query(CaseKnowledgeMapping)
@@ -1024,13 +1022,15 @@ def get_knowledge_mappings(case_id: int, db: Session = Depends(get_db)):
     return [m.to_dict() for m in mappings]
 
 
-@app.put("/api/knowledge_mappings/{mapping_id}")
-def update_mapping(mapping_id: int, req: UpdateMappingRequest, db: Session = Depends(get_db)):
+@app.put("/knowledge_mappings/{mapping_id}")
+def update_mapping(mapping_id: int, req: UpdateMappingRequest, request: Request, db: Session = Depends(get_db)):
     """人工修改：采纳/拒绝某条知识点关联，或编辑融入方式建议文字。
     只要这次修改让案例的"已采纳"知识点集合发生了变化（新采纳一条、或者把已采纳的改成别的
-    状态），就自动重新生成一遍"适用课程举例"/"教学设计"——不用再手动点按钮触发，见
-    knowledge_matching.enrich_case_from_accepted_mappings()。这一步涉及真实LLM调用，
-    接口响应会比单纯改个状态慢一些。"""
+    状态），就自动重新生成一遍"适用课程举例"/"教学设计"。
+
+    这个重新生成涉及真实LLM调用（几十秒），所以是提交成后台任务、本接口立刻返回，不再让
+    "改个下拉框状态"这么个小操作卡在一次模型调用上。触发了的话返回体里会多一个
+    enrich_job_id，前端拿它去轮询，完成后再刷新案例内容。"""
     mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == mapping_id).first()
     if not mapping:
         raise HTTPException(404, "关联记录不存在")
@@ -1046,29 +1046,20 @@ def update_mapping(mapping_id: int, req: UpdateMappingRequest, db: Session = Dep
     result = mapping.to_dict()
     accepted_set_changed = req.status is not None and "已采纳" in (old_status, req.status) and old_status != req.status
     if accepted_set_changed:
-        case = db.query(Case).filter(Case.id == mapping.case_id).first()
-        if case:
-            try:
-                changes = enrich_case_from_accepted_mappings(db, case)
-                if changes:
-                    db.commit()
-                    db.refresh(case)
-                    log_case_change(db, case.id, "知识点匹配(自动)", changes)
-            except ValueError as e:
-                # 重新生成失败（比如API key没配好）不应该让"采纳/取消采纳"这个状态改动本身失败——
-                # 状态已经落库了，只是适用课程举例/教学设计这次没能自动刷新；用一个附加字段告诉
-                # 前端这个情况，而不是把整个请求判定为失败（返回体形状要跟正常情况一致，前端才能
-                # 正常解析出mapping数据，不能直接raise一个跟mapping.to_dict()完全不同形状的错误体）
-                result["enrich_warning"] = f"状态已更新，但自动生成适用课程举例/教学设计失败：{e}"
+        user = getattr(request.state, "user", None)
+        result["enrich_job_id"] = submit_enrich_job(
+            mapping.case_id, requested_by=user.id if user else None
+        )
 
     return result
 
 
-@app.delete("/api/knowledge_mappings/{mapping_id}")
-def delete_knowledge_mapping(mapping_id: int, db: Session = Depends(get_db)):
+@app.delete("/knowledge_mappings/{mapping_id}")
+def delete_knowledge_mapping(mapping_id: int, request: Request, db: Session = Depends(get_db)):
     """解绑一条案例↔知识点关联。如果这条关联当时是"已采纳"状态，解绑后案例的"已采纳"集合
     也跟着变了，同样要重新生成一遍"适用课程举例"/"教学设计"（如果解绑后已采纳集合空了，
-    这两个字段会被清空，不会留着解绑前的旧内容）。"""
+    这两个字段会被清空，不会留着解绑前的旧内容）——跟PUT那个接口一样走后台任务，
+    返回体里带enrich_job_id给前端轮询。"""
     mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == mapping_id).first()
     if not mapping:
         raise HTTPException(404, "关联记录不存在")
@@ -1080,22 +1071,15 @@ def delete_knowledge_mapping(mapping_id: int, db: Session = Depends(get_db)):
 
     result = {"unbound": True}
     if was_accepted:
-        case = db.query(Case).filter(Case.id == case_id).first()
-        if case:
-            try:
-                changes = enrich_case_from_accepted_mappings(db, case)
-                if changes:
-                    db.commit()
-                    log_case_change(db, case.id, "知识点匹配(自动)", changes)
-            except ValueError as e:
-                result["enrich_warning"] = f"已解绑，但自动生成适用课程举例/教学设计失败：{e}"
+        user = getattr(request.state, "user", None)
+        result["enrich_job_id"] = submit_enrich_job(case_id, requested_by=user.id if user else None)
 
     return result
 
 
 # ---------- 知识图谱 ----------
 
-@app.get("/api/knowledge_graph.png")
+@app.get("/knowledge_graph.png")
 def get_knowledge_graph_png(db: Session = Depends(get_db)):
     """维度→案例→知识点 三层关系图的静态图片，只统计已采纳的案例与已采纳的知识点关联"""
     graph = build_graph(db)
@@ -1103,7 +1087,7 @@ def get_knowledge_graph_png(db: Session = Depends(get_db)):
     return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
 
 
-@app.get("/api/knowledge_graph.html")
+@app.get("/knowledge_graph.html")
 def get_knowledge_graph_html(db: Session = Depends(get_db)):
     """同一份图谱的可交互HTML版本（可拖拽缩放），单独打开查看"""
     graph = build_graph(db)
@@ -1113,7 +1097,7 @@ def get_knowledge_graph_html(db: Session = Depends(get_db)):
 
 # ---------- 成书编译 ----------
 
-@app.get("/api/book/export")
+@app.get("/book/export")
 def export_book(status: str = "已采纳", db: Session = Depends(get_db)):
     """
     按"前言 + 按维度分章 + 附录一/二/三 + 知识图谱"的固定版式，
@@ -1130,3 +1114,13 @@ def export_book(status: str = "已采纳", db: Session = Depends(get_db)):
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "思政案例生成工作台 API 运行中"}
+
+
+@app.get("/health")
+def health():
+    """容器存活探针。compose 的 healthcheck 直接打容器内的 http://localhost:8000/health
+    （不经过 nginx，所以路径不带 /api）；从浏览器则是 https://域名/api/health。
+    故意只返回静态 JSON、不碰数据库——这个探针要回答的是"进程还活着吗"，如果把数据库
+    连通性也算进来，MySQL 抖一下就会导致 api 容器被判定不健康、进而被 restart，
+    但其实进程本身好好的，重启只会让问题更糟。"""
+    return {"status": "ok"}

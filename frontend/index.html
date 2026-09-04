@@ -46,6 +46,12 @@
   }
   /* ---------- 标签导航 ---------- */
   .tab-nav { display: flex; gap: 4px; background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 0 24px; }
+  /* 后台任务进度条，横跨所有标签页常驻 */
+  .job-bar { background: #fdf6e9; border-bottom: 1px solid var(--warning); padding: 8px 24px;
+             display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+  .job-bar .job-row { display: flex; align-items: center; gap: 8px; color: #7a5410; }
+  .job-bar .job-spinner { display: inline-block; animation: job-spin 1.4s linear infinite; }
+  @keyframes job-spin { to { transform: rotate(360deg); } }
   .tab-btn {
     background: none; border: none; color: var(--muted); padding: 12px 18px; margin: 0;
     font-size: 14px; cursor: pointer; border-bottom: 3px solid transparent;
@@ -263,6 +269,10 @@
   </div>
 </div>
 
+<!-- 后台任务进度条：不属于任何一个标签页，切换标签/刷新页面都在，靠轮询 /api/jobs 更新。
+     案例生成这类要跑十几分钟的任务不再占着HTTP连接，进度统一在这里看 -->
+<div class="job-bar" id="jobBar" style="display:none;"></div>
+
 <div class="tab-nav">
   <button class="tab-btn active" data-view="chat" onclick="switchView('chat')">💬 AI 助手</button>
   <button class="tab-btn" data-view="library" onclick="switchView('library')">📂 素材库</button>
@@ -410,8 +420,8 @@
   <div class="card">
     <h2>知识图谱</h2>
     <div class="chat-hint" style="text-align:left;padding:0 0 6px;">基于"已采纳"状态的案例、以及已采纳的知识点关联，画出 维度→案例→知识点 三层关系图。</div>
-    <button class="secondary" onclick="viewProtectedResource(API_BASE + '/api/knowledge_graph.png')">🖼 查看图谱（图片）</button>
-    <button class="secondary" onclick="viewProtectedResource(API_BASE + '/api/knowledge_graph.html')">🕸 查看图谱（可交互）</button>
+    <button class="secondary" onclick="viewProtectedResource(API_BASE + '/knowledge_graph.png')">🖼 查看图谱（图片）</button>
+    <button class="secondary" onclick="viewProtectedResource(API_BASE + '/knowledge_graph.html')">🕸 查看图谱（可交互）</button>
   </div>
 
   <div class="card">
@@ -425,7 +435,6 @@
         <button id="runMatchBtn" onclick="runMatch()">🔍 运行匹配</button>
       </div>
     </div>
-    <div id="matchLoading" class="loading" style="display:none;">⏳ 正在匹配中，请稍候...</div>
     <div id="mappingTable" style="margin-top:10px;"><div class="empty-hint">该案例还没有匹配记录，点击上方"运行匹配"，会按文本相似度给出候选知识点关联，可在下表里人工采纳/拒绝、点击融入方式建议编辑</div></div>
     <button onclick="enrichCurrentCase()" style="background:var(--success)">✨ 用已采纳的知识点，补充该案例的「适用课程举例」与「教学设计」（在AI助手对话里进行）</button>
   </div>
@@ -445,7 +454,12 @@
 <div class="cite-tooltip" id="citeTooltip"></div>
 
 <script>
-const API_BASE = "http://localhost:8082";
+// 所有请求都走相对路径 /api，由 nginx 统一反代到后端容器（见 deploy/nginx.conf）。
+// 用相对路径而不是绝对地址，是为了让同一份前端镜像部署到任何域名/端口都不用改代码、重新构建；
+// 浏览器视角下前后端同源，也就不需要 CORS。
+// 注意：这里是唯一持有 /api 这个前缀的地方，下面所有调用点都写成 `${API_BASE}/cases` 这种
+// 不带前缀的形式，别再往路径里重复写 /api（会变成 /api/api/... 直接404）。
+const API_BASE = '/api';
 
 /* ---------- 登录鉴权 ---------- */
 // 用Authorization请求头带token，不用cookie——前端和后端在开发环境是两个不同origin，
@@ -496,7 +510,7 @@ async function doLogin() {
   errEl.textContent = "";
   if (!username || !password) { errEl.textContent = "请输入用户名和密码"; return; }
   try {
-    const res = await apiFetch(`${API_BASE}/api/auth/login`, {
+    const res = await apiFetch(`${API_BASE}/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
@@ -512,7 +526,7 @@ async function doLogin() {
 }
 
 async function doLogout() {
-  try { await apiFetch(`${API_BASE}/api/auth/logout`, { method: "POST" }); } catch (e) { /* 忽略网络错误，反正也要清本地token */ }
+  try { await apiFetch(`${API_BASE}/auth/logout`, { method: "POST" }); } catch (e) { /* 忽略网络错误，反正也要清本地token */ }
   localStorage.removeItem("auth_token");
   location.reload();
 }
@@ -522,7 +536,7 @@ async function doLogout() {
 async function checkAuthAndBoot() {
   const token = localStorage.getItem("auth_token");
   try {
-    const res = await apiFetch(`${API_BASE}/api/auth/me`, {
+    const res = await apiFetch(`${API_BASE}/auth/me`, {
       headers: token ? { "Authorization": `Bearer ${token}` } : {},
     });
     if (res.ok) {
@@ -609,30 +623,17 @@ function addToolChip(container, text) {
   container.appendChild(div);
 }
 
-// 案例生成走四段式流水线，耗时8-9分钟；这个进度提示原地更新（不是每一步都新增一条消息），
-// 流结束后sendChat()会整体重渲染聊天框（按落库的chatHistory重建DOM），进度事件从不落库，
-// 所以这个临时chip到时候会被自然覆盖掉，不需要手动清理
-const GENERATION_STAGES = ["事实提炼", "正文初稿", "去AI味改写", "结构化字段"];
-let currentProgressChip = null;
+// update_case这个工具调用成功后返回的是完整的案例对象（Case.to_dict()），可以直接给用户
+// 一个案例链接。generate_case_draft不在这里——它现在返回的是{job_id,submitted,message}
+// （提交后台任务，案例还没生成好），走下面addJobSubmittedChip那条路
+const CASE_LINK_TOOLS = new Set(["update_case"]);
 
-function resetProgressChip() {
-  currentProgressChip = null;
+function addJobSubmittedChip(container, job) {
+  const div = document.createElement("div");
+  div.className = "tool-chip";
+  div.textContent = `📋 ${job.message || `后台任务已提交（任务号${job.job_id}）`}`;
+  container.appendChild(div);
 }
-
-function updateProgressChip(container, stage) {
-  const idx = GENERATION_STAGES.indexOf(stage);
-  const label = idx >= 0 ? `⏳ ${stage}中 (${idx + 1}/${GENERATION_STAGES.length})` : `⏳ ${stage}中`;
-  if (!currentProgressChip || !currentProgressChip.isConnected) {
-    currentProgressChip = document.createElement("div");
-    currentProgressChip.className = "tool-chip";
-    container.appendChild(currentProgressChip);
-  }
-  currentProgressChip.textContent = label;
-  container.scrollTop = container.scrollHeight;
-}
-
-// 这两个工具调用成功后返回的是完整的案例对象（Case.to_dict()），可以直接给用户一个案例链接
-const CASE_LINK_TOOLS = new Set(["generate_case_draft", "update_case"]);
 
 function addCaseLinkChip(container, caseObj) {
   const div = document.createElement("div");
@@ -645,7 +646,7 @@ function addCaseLinkChip(container, caseObj) {
 async function openCaseFromChat(id) {
   if (!casesCache.find(c => c.id === id)) {
     try {
-      const res = await apiFetch(`${API_BASE}/api/cases/${id}`);
+      const res = await apiFetch(`${API_BASE}/cases/${id}`);
       if (res.ok) casesCache.unshift(await res.json());
     } catch (e) {
       // 拿不到就算了，下面openCaseDetail找不到会静默不弹窗
@@ -678,20 +679,23 @@ function renderChatMessages() {
       if (typeof msg.content === "string") {
         addBubble(box, "user", stripContextPrefix(msg.content));
       } else {
-        let shownCaseLink = false;
+        let shownDetail = false;
         for (const block of msg.content) {
           if (block.type !== "tool_result") continue;
-          if (CASE_LINK_TOOLS.has(toolNameById[block.tool_use_id])) {
-            try {
-              const parsed = JSON.parse(block.content);
-              if (parsed && parsed.id && !parsed.error) {
-                addCaseLinkChip(box, parsed);
-                shownCaseLink = true;
-              }
-            } catch (e) { /* 不是预期的案例JSON，走下面兜底展示 */ }
-          }
+          try {
+            const parsed = JSON.parse(block.content);
+            if (!parsed || parsed.error) continue;
+            if (parsed.submitted && parsed.job_id) {
+              // 提交后台任务类的工具（生成案例/补充知识点），案例还没做好，只提示已提交
+              addJobSubmittedChip(box, parsed);
+              shownDetail = true;
+            } else if (CASE_LINK_TOOLS.has(toolNameById[block.tool_use_id]) && parsed.id) {
+              addCaseLinkChip(box, parsed);
+              shownDetail = true;
+            }
+          } catch (e) { /* 不是预期的JSON，走下面兜底展示 */ }
         }
-        if (!shownCaseLink) addToolChip(box, "⚙️ 工具执行完成");
+        if (!shownDetail) addToolChip(box, "⚙️ 工具执行完成");
       }
     } else if (msg.role === "assistant") {
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
@@ -707,15 +711,20 @@ function renderChatMessages() {
   box.scrollTop = box.scrollHeight;
 }
 
-function setChatLoading(loading) {
-  document.getElementById("chatStatusHint").textContent = loading
-    ? "AI助手正在处理中，如果涉及生成新案例（事实提炼→写正文→去AI味润色→补全其余字段，分四步走，正文现在要求写够2200字以上）实测可能需要10-20分钟，请不要关闭页面；其余的编辑/改写操作通常10-30秒，请稍候..."
+// 哪些会话有请求正在跑。用集合而不是一个布尔值，是因为用户可以在A会话发完消息就切到B会话，
+// 两边各自都可能有在途请求——提示文字要跟着"当前正在看哪个会话"走，不能被另一个会话的
+// 完成/开始事件误清除或误设置
+const pendingChatSessions = new Set();
+
+function refreshChatLoadingHint() {
+  document.getElementById("chatStatusHint").textContent = pendingChatSessions.has(currentSessionId)
+    ? "AI助手正在处理中，通常10-30秒。案例生成/知识点补充是提交后台任务，会立刻返回，之后在页面顶部看进度条即可，不用一直等在这里。"
     : "案例生成、逐段编辑、审核状态调整都可以直接在这里用自然语言完成；素材导入和最终导出仍在专门的标签页里。";
 }
 
 /* ---- 会话（session）管理：左侧栏历史记录 ---- */
 async function loadSessions() {
-  const res = await apiFetch(`${API_BASE}/api/chat/sessions`);
+  const res = await apiFetch(`${API_BASE}/chat/sessions`);
   sessionsCache = await res.json();
   if (sessionsCache.length === 0) {
     await createNewSession();
@@ -738,7 +747,7 @@ function renderSessionList() {
 }
 
 async function createNewSession() {
-  const res = await apiFetch(`${API_BASE}/api/chat/sessions`, { method: "POST" });
+  const res = await apiFetch(`${API_BASE}/chat/sessions`, { method: "POST" });
   const session = await res.json();
   sessionsCache.unshift({ id: session.id, title: session.title, updated_at: session.updated_at, message_count: 0 });
   currentSessionId = session.id;
@@ -750,15 +759,17 @@ async function createNewSession() {
 async function switchSession(id) {
   if (id === currentSessionId) return;
   currentSessionId = id;
-  const res = await apiFetch(`${API_BASE}/api/chat/sessions/${id}`);
+  // 从后端重新拉这个会话的历史，而不是用内存里的——切走期间它可能有在途请求已经完成并落库了
+  const res = await apiFetch(`${API_BASE}/chat/sessions/${id}`);
   const session = await res.json();
   chatHistory = session.messages || [];
   renderSessionList();
   renderChatMessages();
+  refreshChatLoadingHint();  // 新会话自己有没有在途请求，提示文字要跟着换
 }
 
 async function deleteSession(id) {
-  await apiFetch(`${API_BASE}/api/chat/sessions/${id}`, { method: "DELETE" });
+  await apiFetch(`${API_BASE}/chat/sessions/${id}`, { method: "DELETE" });
   sessionsCache = sessionsCache.filter(s => s.id !== id);
   if (currentSessionId === id) {
     currentSessionId = null;
@@ -779,13 +790,23 @@ async function sendChat(overrideText) {
   if (overrideText === undefined) input.value = "";
   if (!currentSessionId) await createNewSession();
 
+  // 把"这次请求属于哪个session"在发出去之前就锁定下来。下面流式返回可能要好几秒甚至更久，
+  // 期间用户完全可能已经切到别的session去了（switchSession只是改currentSessionId，
+  // 不会取消这个还在跑的fetch）。如果收尾时还去读全局的currentSessionId，就会把这个旧
+  // session的历史记录赋值给正在显示的另一个session，造成聊天内容串台。
+  const requestSessionId = currentSessionId;
+
   chatHistory.push({ role: "user", content: rawText });
   renderChatMessages();
-  setChatLoading(true);
+  pendingChatSessions.add(requestSessionId);
+  refreshChatLoadingHint();
 
   const box = document.getElementById("chatMessages");
   let streamText = "";
   let streamBubble = null;
+  // 流式过程中每次要往界面上写东西之前都得确认一下：用户还停在发起这次请求的那个session吗？
+  // 切走了就只在后台把数据收好，不去动当前显示的内容
+  const isStillCurrent = () => requestSessionId === currentSessionId;
 
   const flushBubble = () => {
     // 每次工具调用之间要开新气泡：agent一轮里可能是"说一段话→调工具→再说一段话"，
@@ -795,10 +816,10 @@ async function sendChat(overrideText) {
   };
 
   try {
-    const res = await apiFetch(`${API_BASE}/api/chat`, {
+    const res = await apiFetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: currentSessionId, message: rawText }),
+      body: JSON.stringify({ session_id: requestSessionId, message: rawText }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -823,6 +844,7 @@ async function sendChat(overrideText) {
 
         if (payload.type === "token") {
           streamText += payload.text;
+          if (!isStillCurrent()) continue;  // 用户已经切到别的会话，不往当前界面上画
           if (!streamBubble) {
             streamBubble = document.createElement("div");
             streamBubble.className = "msg assistant";
@@ -832,38 +854,45 @@ async function sendChat(overrideText) {
           box.scrollTop = box.scrollHeight;
         } else if (payload.type === "tool_call") {
           flushBubble();
-          resetProgressChip(); // 每次新工具调用都重开一个进度chip，避免上一次生成的进度残留
+          if (!isStillCurrent()) continue;
           addToolChip(box, `🔧 调用工具：${payload.name}`);
           box.scrollTop = box.scrollHeight;
-        } else if (payload.type === "progress") {
-          updateProgressChip(box, payload.stage);
         } else if (payload.type === "error") {
           throw new Error(payload.message);
         } else if (payload.type === "done") {
-          chatHistory = payload.messages;
+          // 会话列表那一条（标题/时间/消息数）不管用户切没切走都要更新，但要按
+          // requestSessionId去定位，不能用currentSessionId（那可能已经是别的会话了）
           if (payload.session) {
-            const idx = sessionsCache.findIndex(s => s.id === currentSessionId);
+            const idx = sessionsCache.findIndex(s => s.id === requestSessionId);
             if (idx >= 0) {
               const [item] = sessionsCache.splice(idx, 1);
               item.title = payload.session.title;
               item.updated_at = payload.session.updated_at;
-              item.message_count = chatHistory.length;
+              item.message_count = (payload.messages || []).length;
               sessionsCache.unshift(item);
             }
             renderSessionList();
           }
+          // chatHistory是"当前正在显示的那个会话的历史"，只有用户还停在原会话时才能覆盖它；
+          // 切走了就不要动——那份历史已经在后端落库了，用户切回来时switchSession会重新拉取
+          if (isStillCurrent()) chatHistory = payload.messages;
         }
       }
     }
 
     // 流结束后用后端落库的完整历史整体重渲染一遍：既能保证工具调用/文本的顺序和存储结构完全一致，
     // 也能让markdown按完整文本重新解析一次（流式过程中片段化的markdown可能渲染得不完整，比如没读完的表格）
-    renderChatMessages();
+    if (isStillCurrent()) renderChatMessages();
   } catch (e) {
-    chatHistory.push({ role: "assistant", content: `⚠ ${e.message}` });
-    renderChatMessages();
+    if (isStillCurrent()) {
+      chatHistory.push({ role: "assistant", content: `⚠ ${e.message}` });
+      renderChatMessages();
+    } else {
+      toast(`另一个会话的请求出错：${e.message}`);
+    }
   } finally {
-    setChatLoading(false);
+    pendingChatSessions.delete(requestSessionId);
+    refreshChatLoadingHint();  // 内部按currentSessionId判断，切走了不会误清掉当前会话的提示
   }
 }
 
@@ -902,7 +931,7 @@ async function importMaterials() {
   }
   document.getElementById("importLoading").style.display = "block";
   try {
-    const res = await apiFetch(`${API_BASE}/api/materials/import`, {
+    const res = await apiFetch(`${API_BASE}/materials/import`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ case_code: caseCode, urls }),
@@ -945,7 +974,7 @@ async function uploadFile(file) {
 
   document.getElementById("uploadLoading").style.display = "block";
   try {
-    const res = await apiFetch(`${API_BASE}/api/materials/upload`, { method: "POST", body: formData });
+    const res = await apiFetch(`${API_BASE}/materials/upload`, { method: "POST", body: formData });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "上传失败");
     toast(`《${file.name}》解析完成，拆分出 ${data.segment_count} 条候选案例，已存入素材库`);
@@ -963,7 +992,7 @@ const SOURCE_ICON = { url: "🔗", docx: "📝", pdf: "📄" };
 const SIZHENG_DIMENSIONS = ["政治认同", "家国情怀", "文化素养", "宪法法治意识", "道德修养"];
 
 async function loadMaterialCaseCodes() {
-  const res = await apiFetch(`${API_BASE}/api/materials/case_codes`);
+  const res = await apiFetch(`${API_BASE}/materials/case_codes`);
   const data = await res.json();
 
   const filterSel = document.getElementById("materialCaseFilter");
@@ -985,7 +1014,7 @@ async function loadMaterials() {
   if (caseCode) params.set("case_code", caseCode);
   if (q) params.set("q", q);
 
-  const res = await apiFetch(`${API_BASE}/api/materials?${params.toString()}`);
+  const res = await apiFetch(`${API_BASE}/materials?${params.toString()}`);
   materialsCache = await res.json();
   renderMaterialList();
 }
@@ -1051,7 +1080,7 @@ function clearMaterialSelection() {
 async function deleteMaterial(id) {
   if (!confirm("确定删除这条素材吗？删除后不可恢复。")) return;
   try {
-    const res = await apiFetch(`${API_BASE}/api/materials/${id}`, { method: "DELETE" });
+    const res = await apiFetch(`${API_BASE}/materials/${id}`, { method: "DELETE" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "删除失败");
     selectedMaterialIds.delete(id);
@@ -1076,7 +1105,7 @@ function closePreview() {
 
 /* ================= 案例库：列表 + 勾选导出Word ================= */
 async function loadCases() {
-  const res = await apiFetch(`${API_BASE}/api/cases`);
+  const res = await apiFetch(`${API_BASE}/cases`);
   casesCache = await res.json();
   renderCaseList();
   populateMatchCaseSelect();
@@ -1114,7 +1143,7 @@ async function deleteSelectedCases() {
   if (!confirm(`确定删除勾选的 ${ids.length} 个案例吗？删除后不可恢复。`)) return;
 
   const results = await Promise.allSettled(
-    ids.map(id => apiFetch(`${API_BASE}/api/cases/${id}`, { method: "DELETE" }))
+    ids.map(id => apiFetch(`${API_BASE}/cases/${id}`, { method: "DELETE" }))
   );
   const failCount = results.filter(r => r.status === "rejected" || !r.value.ok).length;
   selectedCaseIds.clear();
@@ -1142,7 +1171,7 @@ async function openCaseDetail(id) {
   loadCaseMaterialsForCitations(id); // 不等它，加载完悬浮预览自然就能用了，不阻塞详情本身的展示
 
   try {
-    const res = await apiFetch(`${API_BASE}/api/cases/${id}/audit_log`);
+    const res = await apiFetch(`${API_BASE}/cases/${id}/audit_log`);
     const logs = await res.json();
     document.getElementById("previewBody").innerHTML = editBtnHtml + renderCaseDetailHTML(c) + renderAuditLogHTML(logs);
     renderCourseTree(c);
@@ -1157,7 +1186,7 @@ const caseMaterialsCache = {}; // case_id -> [{id,url,title,full_text}, ...]，�
 async function loadCaseMaterialsForCitations(caseId) {
   if (caseMaterialsCache[caseId]) return caseMaterialsCache[caseId];
   try {
-    const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/materials`);
+    const res = await apiFetch(`${API_BASE}/cases/${caseId}/materials`);
     const data = await res.json();
     caseMaterialsCache[caseId] = data.materials || [];
   } catch (e) {
@@ -1616,7 +1645,7 @@ async function saveCaseEdit() {
   };
 
   try {
-    const res = await apiFetch(`${API_BASE}/api/cases/${editingCaseId}`, {
+    const res = await apiFetch(`${API_BASE}/cases/${editingCaseId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1637,7 +1666,7 @@ async function exportSelectedCases() {
   const ids = Array.from(selectedCaseIds);
   if (ids.length === 0) { toast("请先勾选要导出的案例"); return; }
   try {
-    const res = await apiFetch(`${API_BASE}/api/cases/export`, {
+    const res = await apiFetch(`${API_BASE}/cases/export`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ case_ids: ids }),
@@ -1664,7 +1693,7 @@ async function exportSelectedCases() {
 async function exportBook() {
   toast("正在生成成书Word（前言+按维度分章+附录+知识图谱），请稍候…");
   try {
-    const res = await apiFetch(`${API_BASE}/api/book/export?status=已采纳`);
+    const res = await apiFetch(`${API_BASE}/book/export?status=已采纳`);
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       throw new Error(data.detail || `导出失败(${res.status})`);
@@ -1697,7 +1726,7 @@ let editingKnowledgeId = null;
 let _knowledgeSearchDebounceTimer = null;
 
 async function loadKnowledgePoints() {
-  const res = await apiFetch(`${API_BASE}/api/knowledge/courses`);
+  const res = await apiFetch(`${API_BASE}/knowledge/courses`);
   knowledgeCourses = await res.json();
   populateCourseFilter();
   if (knowledgeSearchQuery) {
@@ -1731,7 +1760,7 @@ function onKnowledgeSearchInput(value) {
 }
 
 async function loadKnowledgeSearch(page) {
-  const res = await apiFetch(`${API_BASE}/api/knowledge?q=${encodeURIComponent(knowledgeSearchQuery)}&page=${page}&page_size=20`);
+  const res = await apiFetch(`${API_BASE}/knowledge?q=${encodeURIComponent(knowledgeSearchQuery)}&page=${page}&page_size=20`);
   knowledgeSearchData = await res.json();
   renderKnowledgeList();
 }
@@ -1747,7 +1776,7 @@ async function toggleCourseExpand(courseName) {
 }
 
 async function loadExpandedCourse(courseName, page) {
-  const res = await apiFetch(`${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}&page=${page}&page_size=20`);
+  const res = await apiFetch(`${API_BASE}/knowledge?course_name=${encodeURIComponent(courseName)}&page=${page}&page_size=20`);
   expandedCourseData = await res.json();
   renderKnowledgeList();
 }
@@ -1761,7 +1790,7 @@ function changeKnowledgePage(kind, page) {
 /* 增/删/改知识点之后统一走这里刷新：课程名+数量列表，以及当前正打开的那个视图
    （搜索结果 或 展开的课程），不用再手动维护本地缓存的增删改 */
 async function refreshKnowledgeView() {
-  const res = await apiFetch(`${API_BASE}/api/knowledge/courses`);
+  const res = await apiFetch(`${API_BASE}/knowledge/courses`);
   knowledgeCourses = await res.json();
   populateCourseFilter();
   if (knowledgeSearchQuery) {
@@ -1774,7 +1803,7 @@ async function refreshKnowledgeView() {
 }
 
 async function _deleteKnowledgeByCourseRequest(courseName, force) {
-  const url = `${API_BASE}/api/knowledge?course_name=${encodeURIComponent(courseName)}${force ? "&force=true" : ""}`;
+  const url = `${API_BASE}/knowledge?course_name=${encodeURIComponent(courseName)}${force ? "&force=true" : ""}`;
   const res = await apiFetch(url, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok) {
@@ -1814,7 +1843,7 @@ async function addKnowledgePointManually() {
   const description = document.getElementById("newKpDescription").value.trim();
   if (!course_name || !description) { toast("课程名称和知识点描述不能为空"); return; }
   try {
-    const res = await apiFetch(`${API_BASE}/api/knowledge`, {
+    const res = await apiFetch(`${API_BASE}/knowledge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ course_name, chapter, description }),
@@ -1932,7 +1961,7 @@ async function saveKnowledgeEdit(id) {
   };
   if (!payload.description) { toast("知识点描述不能为空"); return; }
   try {
-    const res = await apiFetch(`${API_BASE}/api/knowledge/${id}`, {
+    const res = await apiFetch(`${API_BASE}/knowledge/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1948,7 +1977,7 @@ async function saveKnowledgeEdit(id) {
 }
 
 async function _deleteKnowledgePointRequest(id, force) {
-  const url = `${API_BASE}/api/knowledge/${id}${force ? "?force=true" : ""}`;
+  const url = `${API_BASE}/knowledge/${id}${force ? "?force=true" : ""}`;
   const res = await apiFetch(url, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok) {
@@ -1982,10 +2011,15 @@ async function unbindKnowledgeCase(mappingId) {
   if (!confirm("确定要解绑这条知识点和案例的关联吗？如果这条之前是「已采纳」状态，解绑后案例的"
     + "「适用课程举例」「教学设计」会自动重新生成。")) return;
   try {
-    const res = await apiFetch(`${API_BASE}/api/knowledge_mappings/${mappingId}`, { method: "DELETE" });
+    const res = await apiFetch(`${API_BASE}/knowledge_mappings/${mappingId}`, { method: "DELETE" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "解绑失败");
-    toast(data.enrich_warning ? `已解绑；${data.enrich_warning}` : "已解绑");
+    if (data.enrich_job_id) {
+      toast("已解绑；适用课程举例/教学设计正在后台更新，完成后会提示");
+      pollActiveJobs();
+    } else {
+      toast("已解绑");
+    }
     refreshKnowledgeView();
   } catch (e) {
     toast("解绑出错: " + e.message);
@@ -2005,7 +2039,7 @@ async function uploadKnowledgeFiles(files) {
 
   document.getElementById("knowledgeUploadLoading").style.display = "block";
   try {
-    const res = await apiFetch(`${API_BASE}/api/knowledge/upload`, { method: "POST", body: fd });
+    const res = await apiFetch(`${API_BASE}/knowledge/upload`, { method: "POST", body: fd });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "上传失败");
     let msg = `解析完成：${valid.length}个文件，新增 ${data.count} 条知识点`;
@@ -2036,7 +2070,7 @@ async function loadCaseMappings(caseId) {
   currentMatchCaseId = caseId ? parseInt(caseId) : null;
   if (!caseId) { currentMappings = []; renderMappingTable(); return; }
   try {
-    const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/knowledge_mappings`);
+    const res = await apiFetch(`${API_BASE}/cases/${caseId}/knowledge_mappings`);
     if (!res.ok) throw new Error("加载失败");
     currentMappings = await res.json();  // 这个GET端点直接返回数组，跟match_knowledge的{mappings:[...]}不一样
   } catch (e) {
@@ -2051,23 +2085,19 @@ async function runMatch() {
   if (!caseId) { toast("请先在「案例库」里生成至少一个案例"); return; }
   currentMatchCaseId = parseInt(caseId);
   const btn = document.getElementById("runMatchBtn");
-  const loadingEl = document.getElementById("matchLoading");
   btn.disabled = true;
-  loadingEl.style.display = "block";
   try {
-    const res = await apiFetch(`${API_BASE}/api/cases/${caseId}/match_knowledge`, { method: "POST" });
+    // 现在这个接口只提交任务、立刻返回（202），实际匹配在后台跑。完成后由顶部的任务
+    // 轮询（handleJobFinished）负责弹提示 + 调 loadCaseMappings 刷新表格，这里不用等
+    const res = await apiFetch(`${API_BASE}/cases/${caseId}/match_knowledge`, { method: "POST" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "匹配失败");
-    toast(`匹配完成，新增 ${data.mappings.length} 条候选`);
-    // 重算只会清空未处理的"推荐"记录、保留已采纳/已拒绝（后端逻辑），这里重新拉取这个
-    // 案例完整的匹配记录来渲染，而不是只用本次响应里新建的这一批，避免把已采纳/已拒绝的
-    // 历史判断从表格里漏掉
-    await loadCaseMappings(caseId);
+    toast("已提交匹配任务，完成后候选列表会自动刷新");
+    pollActiveJobs();  // 立刻拉一次，别等下一个8秒周期才让进度条冒出来
   } catch (e) {
     toast("匹配出错: " + e.message);
   } finally {
     btn.disabled = false;
-    loadingEl.style.display = "none";
   }
 }
 
@@ -2114,7 +2144,7 @@ function openSuggestionEdit(id) {
 async function saveSuggestionEdit(id) {
   const suggestion_text = document.getElementById("suggestionEditArea").value;
   try {
-    const res = await apiFetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
+    const res = await apiFetch(`${API_BASE}/knowledge_mappings/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ suggestion_text }),
@@ -2134,13 +2164,9 @@ async function saveSuggestionEdit(id) {
 async function saveMappingStatus(id) {
   const select = document.getElementById(`status_${id}`);
   const status = select.value;
-  // 采纳/取消采纳会触发后端自动重新生成"适用课程举例"/"教学设计"（真实LLM调用），
-  // 不是瞬间完成，禁用一下下拉框、给个提示，避免用户以为卡住了又重复点
-  const isAcceptChange = status === "已采纳" || select.dataset.prevStatus === "已采纳";
   select.disabled = true;
-  if (isAcceptChange) toast("正在保存并自动生成适用课程举例/教学设计，请稍候…");
   try {
-    const res = await apiFetch(`${API_BASE}/api/knowledge_mappings/${id}`, {
+    const res = await apiFetch(`${API_BASE}/knowledge_mappings/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
@@ -2150,7 +2176,15 @@ async function saveMappingStatus(id) {
     const idx = currentMappings.findIndex(m => m.id === id);
     if (idx >= 0) currentMappings[idx] = data;
     select.dataset.prevStatus = status;
-    toast(data.enrich_warning ? `已保存；${data.enrich_warning}` : "已保存");
+    // 采纳/取消采纳会让后端起一个后台任务重新生成"适用课程举例"/"教学设计"（真实LLM调用，
+    // 几十秒）。这个PUT本身现在是秒回的，不用等那个任务——顶部进度条会显示它跑到哪了，
+    // 完成时轮询逻辑会弹提示
+    if (data.enrich_job_id) {
+      toast("已保存；适用课程举例/教学设计正在后台更新，完成后会提示");
+      pollActiveJobs();  // 立刻拉一次，让进度条马上出现，不等下一个8秒周期
+    } else {
+      toast("已保存");
+    }
   } catch (e) {
     toast("保存出错: " + e.message);
   } finally {
@@ -2167,6 +2201,93 @@ async function enrichCurrentCase() {
   sendChat(`请用已采纳的知识点，补充${caseLabel}的「适用课程举例」与「教学设计」两部分。`);
 }
 
+/* ================= 后台任务轮询（案例生成/知识点匹配/知识点补充） =================
+   这三个操作都要调大模型，慢的（案例生成的写作-评审循环）要十几分钟。它们现在都是"提交
+   后台任务立刻返回"，进度由后端写数据库，这里定时轮询 /api/jobs 展示。
+   好处是不依赖任何一条长连接：切标签页、刷新页面、临时断网都不影响，重新轮询就能接着看到
+   进度；页面关掉了任务也照常在后端跑完。 */
+const JOB_POLL_INTERVAL_MS = 8000;
+const JOB_TYPE_LABELS = {
+  generate: "案例生成", match_knowledge: "知识点匹配", enrich: "补充适用课程/教学设计",
+};
+let jobPollTimer = null;
+// 记住上一轮看到的进行中任务，用来判断"这一轮消失的任务"是刚刚完成的，好弹提示+联动刷新。
+// 存的是id->job快照，因为任务从列表里消失时就查不到它的类型/案例编号了
+let knownActiveJobs = new Map();
+
+function startJobPolling() {
+  if (jobPollTimer) clearInterval(jobPollTimer);
+  pollActiveJobs();
+  jobPollTimer = setInterval(pollActiveJobs, JOB_POLL_INTERVAL_MS);
+}
+
+function jobLabel(job) {
+  const what = JOB_TYPE_LABELS[job.job_type] || job.job_type;
+  const target = job.case_code ? `案例${job.case_code}` : (job.case_id ? `案例ID${job.case_id}` : "");
+  const stage = job.current_stage ? ` · ${job.current_stage}` : "";
+  const queued = job.status === "pending" ? "（排队中）" : "";
+  return `${what}${target ? " " + target : ""}${stage}${queued}`;
+}
+
+async function pollActiveJobs() {
+  let active;
+  try {
+    const res = await apiFetch(`${API_BASE}/jobs?status=pending,running`);
+    if (!res.ok) return;   // 未登录/后端暂时不可用，静默跳过这一轮，下一轮再试
+    active = await res.json();
+  } catch (e) {
+    return;  // 网络抖动不弹错误提示，轮询本来就是每隔几秒重试
+  }
+
+  const activeIds = new Set(active.map(j => j.id));
+  // 上一轮还在跑、这一轮不在活跃列表里了 → 已经结束（done或failed），去查一下最终结果
+  for (const [id, prev] of knownActiveJobs) {
+    if (!activeIds.has(id)) handleJobFinished(id, prev);
+  }
+  knownActiveJobs = new Map(active.map(j => [j.id, j]));
+  renderJobBar(active);
+}
+
+function renderJobBar(active) {
+  const bar = document.getElementById("jobBar");
+  if (!active || active.length === 0) { bar.style.display = "none"; bar.innerHTML = ""; return; }
+  bar.style.display = "flex";
+  bar.innerHTML = active.map(j =>
+    `<div class="job-row"><span class="job-spinner">⏳</span><span>${escHtml(jobLabel(j))}</span></div>`
+  ).join("");
+}
+
+async function handleJobFinished(jobId, prevSnapshot) {
+  let job;
+  try {
+    const res = await apiFetch(`${API_BASE}/jobs/${jobId}`);
+    if (!res.ok) return;
+    job = await res.json();
+  } catch (e) {
+    return;
+  }
+  const what = JOB_TYPE_LABELS[job.job_type] || job.job_type;
+
+  if (job.status === "failed") {
+    toast(`❌ ${what}失败：${job.error || "未知原因"}`);
+    return;
+  }
+  if (job.status !== "done") return;  // 还在跑（比如刚好卡在两次轮询之间），下一轮再处理
+
+  if (job.job_type === "generate") {
+    const code = job.result_case?.case_code || job.case_code || "";
+    toast(`✅ 案例${code} 生成完成`);
+    loadCases();  // 案例库列表刷新，用户切到那个标签页就能直接看到（不用手动刷新）
+  } else if (job.job_type === "match_knowledge") {
+    toast("✅ 知识点匹配完成");
+    // 如果用户正好在看这个案例的匹配结果，把表格刷新出来
+    if (currentMatchCaseId && job.case_id === currentMatchCaseId) loadCaseMappings(job.case_id);
+  } else if (job.job_type === "enrich") {
+    toast("✅ 适用课程举例/教学设计已更新");
+    loadCases();
+  }
+}
+
 /* ================= 初始化 ================= */
 // 素材/知识点的拖拽上传绑定、建议问题渲染、会话列表加载——这几步涉及真实数据/接口调用，
 // 要等登录校验通过（或AUTH_ENABLED=false测试模式）才执行，不然未登录状态下点按钮会先
@@ -2176,6 +2297,7 @@ function bootApp() {
   wireDropzone("knowledgeDropzone", "knowledgeFileInput", uploadKnowledgeFiles);
   renderSuggestions();
   loadSessions();
+  startJobPolling();
 }
 checkAuthAndBoot();
 </script>

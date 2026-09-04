@@ -1,0 +1,66 @@
+# 后端 API 镜像。构建上下文是仓库根目录（因为 CI 里要同时看到 backend/ 和 requirements），
+# 所以下面所有 COPY 的源路径都带 backend/ 前缀。
+FROM python:3.12.11
+
+# apt 镜像源。默认空 = 用 Debian 官方源，GitHub Actions 构建走这条路（CI 在境外，
+# 官方源本来就快，也符合"镜像里不写死国内源"的初衷）。
+# 本地在国内网络下构建时官方源很慢甚至连不上，传参换成国内镜像即可：
+#   docker build --build-arg APT_MIRROR=mirrors.aliyun.com -f Dockerfile.api .
+# docker-compose.local.yml 里已经默认传了这个参数，本地 compose 构建不用额外操作。
+# 用构建参数而不是直接改死在文件里，是为了本地和 CI 共用同一份 Dockerfile、不用来回改再改回去
+# （改了忘记还原的话，CI 会拿着国内源在境外 runner 上构建，又慢又容易失败）。
+ARG APT_MIRROR=""
+
+# 系统依赖，三样都是运行时真需要、pip 装不了的：
+#  - tesseract-ocr + chi_sim 语言包：扫描版 PDF/图片教学大纲走 OCR 兜底。注意代码里没有用
+#    pytesseract，是 PyMuPDF 的 page.get_textpage_ocr(language="chi_sim") 直接调系统的
+#    tesseract 二进制（见 backend/ocr_utils.py），所以必须装系统包 + 中文训练数据
+#  - fonts-noto-cjk：matplotlib 画知识图谱 PNG 要显示中文（backend/knowledge_graph.py 的字体
+#    候选列表里 "Noto Sans CJK SC" 就是给 Linux 用的），不装的话图上中文全是方框
+# 按 Docker 最佳实践在同一个 RUN 里 update+install+清缓存，避免缓存层被留进镜像白白增大体积。
+#
+# 注意换源的写法：这个基础镜像是 Debian 13 (trixie)，apt 源用的是新的 deb822 格式，配置在
+# /etc/apt/sources.list.d/debian.sources，**没有** /etc/apt/sources.list 这个文件。
+# 网上常见的 `sed -i s/deb.debian.org/xxx/ /etc/apt/sources.list` 在这里会静默什么都不做，
+# 看起来换源成功了其实还在走官方源。
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+        echo "apt 源已切换到 ${APT_MIRROR}"; \
+    fi \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+        tesseract-ocr \
+        tesseract-ocr-chi-sim \
+        fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 先只 COPY requirements.txt 再 pip install，最后才 COPY 业务代码——这样只要依赖清单没变，
+# 改业务代码时 pip install 这一层就能命中缓存直接跳过（几百秒 vs 几秒的差别）。
+# 顺序反过来的话每改一行代码都要把所有依赖重装一遍。
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Playwright 的 pip 包只是 Python 绑定，浏览器内核要单独下载（导出 Word 时用无头 Chromium 把
+# Mermaid 树状图渲染成图片，见 backend/mermaid_render.py）。--with-deps 会连带装好无头 Chromium
+# 依赖的一堆系统库，不用自己一个个试出来缺哪个。
+# 装在 root 阶段、放到全局路径，这样切到非 root 用户后依然读得到。
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN python -m playwright install --with-deps chromium \
+    && chmod -R a+rX /opt/playwright
+
+# 业务代码放在依赖之后 COPY，理由见上面的层缓存说明
+COPY backend/ /app/
+
+# 不用 root 跑：容器逃逸时攻击者拿到的就不是宿主机 root 权限。
+# --system 建系统账号（不需要登录 shell），只把 /app 的属主给它，其余目录保持只读。
+RUN useradd --system --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+# --host 0.0.0.0 必须有：默认只监听 127.0.0.1，那样只有容器自己能访问，
+# nginx 容器从外面连过来会直接连接被拒
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

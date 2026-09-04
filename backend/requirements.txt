@@ -8,7 +8,9 @@ sqlalchemy==2.0.35
 pymysql==1.1.1
 cryptography==43.0.3
 python-multipart==0.0.9
-pydantic==2.9.2
+pydantic==2.13.4  # llama-index-workflows(通过llama-index-core引入)现在要求>=2.11.5，
+                  # 原来锁的2.9.2在全新环境里pip resolve会直接报冲突（ResolutionImpossible）；
+                  # 本地.venv早就在装其他包时被间接升级到2.13.4实测能用，这里补上正确的pin
 python-dotenv==1.0.1
 python-docx==1.1.2
 pymupdf==1.28.0  # 中文PDF解析明显比pypdf更稳（少乱码/少丢字），原来用的pypdf已替换掉

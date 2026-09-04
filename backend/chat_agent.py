@@ -7,7 +7,6 @@ AI 助手对话代理：用 LangChain 的 create_agent（内部基于 LangGraph�
 也可以是 [{"type":"text"/"tool_use"/"tool_result", ...}] 这种block列表）——
 这样不管内部用什么agent框架，前端的聊天渲染逻辑完全不用跟着改。
 """
-import contextvars
 import json
 import queue
 import threading
@@ -18,11 +17,9 @@ from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
 from db import (
-    SessionLocal, RawMaterial, Case, CaseMaterial, CaseKnowledgeMapping, DIMENSIONS,
-    allocate_case_version_code,
+    SessionLocal, RawMaterial, Case, CaseKnowledgeMapping, BackgroundJob, DIMENSIONS,
 )
-from generate_case import generate_case_draft as _generate_case_draft_impl
-from knowledge_matching import enrich_case_from_accepted_mappings as _enrich_case_from_accepted_mappings
+from job_queue import submit_generate_job, submit_enrich_job
 from material_index import search_materials as _search_materials_impl
 from qwen_client import get_langchain_llm, require_api_key, MAX_TOOL_ROUNDS
 from audit import log_case_change
@@ -36,25 +33,15 @@ SYSTEM_PROMPT = f"""你是"思政案例生成工作台"的AI助手，帮助用�
 3. 编辑已有案例前，先用 get_case 工具看当前完整内容，只改用户要求的部分，其余字段原样保留（update_case 只需要传你要修改的字段）。
 4. 修改内容后必须调用 update_case 把结果写回数据库，不要只在聊天里描述而不落库。
 5. 如果用户是在描述内容而不是给出具体案例编号/素材ID（比如"有没有关于XX的素材"），用 search_materials 做语义检索，别瞎猜material_id。
-6. 如果用户要求"用已采纳的知识点补充案例的适用课程举例/教学设计"，直接调用 enrich_case_with_accepted_knowledge 工具（不要自己瞎编内容），完成后可以继续跟用户对话调整细节。
-7. 回复用简短的中文说明你做了什么、案例现在是什么状态，不要大段罗列JSON。
+6. 如果用户要求"用已采纳的知识点补充案例的适用课程举例/教学设计"，直接调用 enrich_case_with_accepted_knowledge 工具（不要自己瞎编内容）。
+7. generate_case_draft 和 enrich_case_with_accepted_knowledge 这两个工具是"提交后台任务"，
+   调用后立刻返回一个job_id，任务还在后台跑，**不代表已经做完了**。这时要如实告诉用户
+   "已经提交、大概要多久、页面顶部有进度条"，绝对不能说成"已经生成好了"，也不要编造进度。
+   用户之后问"生成得怎么样了/好了吗"，用 check_job 工具查真实状态再回答，不要凭感觉猜。
+8. 回复用简短的中文说明你做了什么、案例现在是什么状态，不要大段罗列JSON。
 
 可用的思政维度：{", ".join(DIMENSIONS)}
 """
-
-# 案例生成这个工具耗时8-9分钟起步（正文写作引入了writer/judge/reviser评审循环，评审不通过
-# 时还会再多跑1轮修订+评审，实际耗时会明显超过这个下限，具体取决于CASE_NARRATIVE_MAX_ITERATIONS），
-# 用这个队列把"当前跑到第几步"从工具执行的线程实时传到
-# stream_chat()里跑SSE的那个消费循环，好在聊天界面上显示进度。用ContextVar而不是模块级
-# 全局变量，是因为如果两个用户同时在各自的聊天里触发生成，全局变量会导致进度串台；
-# ContextVar在stream_chat()新起的后台线程里各自独立设置，互不干扰。
-_progress_queue: contextvars.ContextVar = contextvars.ContextVar("progress_queue", default=None)
-
-
-def _emit_progress(stage: str):
-    q = _progress_queue.get()
-    if q is not None:
-        q.put(("progress", stage))
 
 
 @tool
@@ -113,51 +100,48 @@ def get_case(case_id: int) -> str:
 
 @tool
 def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
-    """用指定的素材ID列表，调用模型生成一份新的七段式案例草稿并存入数据库。
+    """用指定的素材ID列表，提交一个"生成七段式案例草稿"的后台任务。
     不需要指定思政维度——每个案例都要求对五个官方思政维度（政治认同/家国情怀/文化素养/
     宪法法治意识/道德修养）逐一给出摘录表述+解释，案例所属的书稿章节分类（也是这五个维度之一）
     由模型结合案例内容自主判断给出。
+
+    **这个工具只负责提交任务，立刻就返回，返回时案例还没生成好**——正文要走写作→评审→修订
+    的多轮循环，通常5-20分钟。返回的job_id可以之后用 check_job 工具查进度。回复用户时要说
+    "已经提交、大概5-20分钟、页面顶部有进度条、完成后案例库里会出现"，不能说成已经生成完了。
+
     如果这个case_code在案例库里已经生成过（不管用的是不是同一批素材），不会覆盖已有案例，
     而是自动落库成 case_code-1、case_code-2……这样的新版本编号，方便同一个编号反复试生成、
-    审核时再挑一个采纳；返回结果里的case_code字段会是实际落库用的这个版本化编号，回复用户时
-    要用这个编号，不要说成用户原来给的那个编号。"""
+    审核时再挑一个采纳。具体用了哪个版本号要等生成完成后才能确定，不要提前告诉用户。"""
     db = SessionLocal()
     try:
         materials = db.query(RawMaterial).filter(RawMaterial.id.in_(material_ids)).all()
         success_materials = [m for m in materials if m.fetch_status == "success"]
         if not success_materials:
             return json.dumps({"error": "所选素材均不可用（未抓取/解析成功），无法生成"}, ensure_ascii=False)
-        payload = [
-            {"id": m.id, "url": m.url, "title": m.source_title, "text": m.fetched_text}
-            for m in success_materials
-        ]
-        try:
-            draft = _generate_case_draft_impl(case_code, payload, on_stage=_emit_progress)
-        except ValueError as e:
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        job_id = submit_generate_job(case_code, [m.id for m in success_materials])
+        return json.dumps({
+            "job_id": job_id,
+            "submitted": True,
+            "message": f"案例{case_code}的生成任务已提交（任务号{job_id}），预计5-20分钟。"
+                       f"任务在后台跑，页面顶部会显示进度，也可以随时问我进度。",
+        }, ensure_ascii=False)
+    finally:
+        db.close()
 
-        case = Case(
-            case_code=allocate_case_version_code(db, case_code),
-            dimension=(draft.get("sizheng_elements") or {}).get("对应维度"),
-            title=draft.get("title"),
-            full_narrative=draft.get("full_narrative"),
-            full_narrative_draft=draft.get("full_narrative_draft"),
-            teaching_objectives=json.dumps(draft.get("teaching_objectives"), ensure_ascii=False),
-            sizheng_elements=json.dumps(draft.get("sizheng_elements"), ensure_ascii=False),
-            # 适用课程举例/教学设计不在初次生成时产出了，等知识点匹配采纳后才会有内容
-            applicable_courses=None,
-            teaching_design=None,
-            further_reading=json.dumps(draft.get("further_reading"), ensure_ascii=False),
-            status="待审核",
-        )
-        db.add(case)
-        db.commit()
-        db.refresh(case)
-        for m in success_materials:
-            db.add(CaseMaterial(case_id=case.id, material_id=m.id))
-        db.commit()
-        log_case_change(db, case.id, "AI助手", {"__created__": {"old": None, "new": "generate_case_draft"}})
-        return json.dumps(case.to_dict(), ensure_ascii=False)
+
+@tool
+def check_job(job_id: int) -> str:
+    """查询一个后台任务（案例生成/知识点匹配/知识点补充）的真实进度。
+    用户问"生成得怎么样了""好了吗""还要多久"这类问题时用这个工具查了再回答，
+    不要凭空猜测或编造进度。
+    返回的status含义：pending=排队中，running=正在跑（current_stage是当前步骤），
+    done=已完成，failed=失败（error字段是原因）。"""
+    db = SessionLocal()
+    try:
+        job = db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        if not job:
+            return json.dumps({"error": f"没有找到任务号{job_id}"}, ensure_ascii=False)
+        return json.dumps(job.to_dict(include_result_case=True), ensure_ascii=False)
     finally:
         db.close()
 
@@ -210,12 +194,16 @@ def update_case(
 
 @tool
 def enrich_case_with_accepted_knowledge(case_id: int) -> str:
-    """用某个案例在「知识点匹配」页面已经人工标记为"已采纳"的知识点关联，调用模型补充/更新
-    这个案例的"适用课程举例"与"教学设计"两个字段，并直接写回数据库。这个案例必须已经跑过
+    """用某个案例在「知识点匹配」页面已经人工标记为"已采纳"的知识点关联，提交一个后台任务，
+    调用模型补充/更新这个案例的"适用课程举例"与"教学设计"两个字段。这个案例必须已经跑过
     知识点匹配、且至少有一条被标记为"已采纳"，否则会返回error，如果报错就把这个情况告诉用户，
     不要自己凭空编造适用课程举例/教学设计的内容。
-    注意：现在采纳/取消采纳知识点关联时后台会自动触发这个逻辑，这个工具通常已经不需要
-    手动调用了，只有用户明确要求"重新生成"之类的场景才用得上。"""
+
+    **这个工具只负责提交任务，立刻就返回，返回时内容还没补充好**（模型调用通常几十秒到
+    一分钟），返回的job_id可以之后用 check_job 查进度。回复用户时不要说成已经补充完了。
+
+    注意：现在用户在页面上采纳/取消采纳知识点关联时后台会自动触发同样的补充任务，这个工具
+    通常不需要手动调用，只有用户明确要求"重新生成一次"之类的场景才用得上。"""
     db = SessionLocal()
     try:
         case = db.query(Case).filter(Case.id == case_id).first()
@@ -233,23 +221,20 @@ def enrich_case_with_accepted_knowledge(case_id: int) -> str:
                 ensure_ascii=False,
             )
 
-        try:
-            changes = _enrich_case_from_accepted_mappings(db, case)
-        except ValueError as e:
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-        db.commit()
-        db.refresh(case)
-        if changes:
-            log_case_change(db, case.id, "AI助手(知识点补充)", changes)
-        return json.dumps(case.to_dict(), ensure_ascii=False)
+        job_id = submit_enrich_job(case_id)
+        return json.dumps({
+            "job_id": job_id,
+            "submitted": True,
+            "message": f"已提交补充任务（任务号{job_id}），预计几十秒到一分钟，完成后案例的"
+                       f"适用课程举例和教学设计会自动更新。",
+        }, ensure_ascii=False)
     finally:
         db.close()
 
 
 TOOLS = [
     list_materials, search_materials, list_cases, get_case, generate_case_draft, update_case,
-    enrich_case_with_accepted_knowledge,
+    enrich_case_with_accepted_knowledge, check_job,
 ]
 
 _agent = None
@@ -318,15 +303,15 @@ def stream_chat(stored_messages: list[dict], user_message: str):
       用它的最后一次取值作为最终要落库的完整对话历史——这样不用自己拼工具调用参数/结果，
       直接复用和非流式版一样的、LangGraph已经组装好的准确状态。
 
-    真正的.stream()迭代放在后台线程（_run_agent）里跑，本函数只从队列里取事件转成yield——
-    这样案例生成这类耗时8-9分钟的工具调用执行期间，工具内部通过_emit_progress塞进同一个
-    队列的进度事件，能穿插在正常的token/tool_call事件之间实时冒出来，而不是让整个生成器
-    在工具调用返回之前完全没有任何输出。
+    真正的.stream()迭代放在后台线程（_run_agent）里跑，本函数只从队列里取事件转成yield。
+
+    注意：所有耗时的LLM操作（案例生成、知识点补充）现在都是"工具提交后台任务后立刻返回"，
+    工具调用本身都是秒级的，这条SSE连接不会再被占用十几分钟。那些长任务的进度改成写数据库、
+    前端轮询 /api/jobs 拿（见job_queue.py），不走这条流。
 
     yield出的事件：
       {"type": "token", "text": ...}                          —— 增量文本，直接拼到当前气泡上
       {"type": "tool_call", "name": ...}                       —— 检测到一次工具调用，前端展示一个工具chip
-      {"type": "progress", "stage": ...}                       —— 耗时工具调用期间的阶段性进度（比如案例生成的四步）
       {"type": "done", "messages": [...], "reply": ...}        —— 流结束，附最终要落库的完整历史
       {"type": "error", "message": ...}                        —— 出错，调用方决定要不要落库当前进度
     """
@@ -338,7 +323,6 @@ def stream_chat(stored_messages: list[dict], user_message: str):
     q: queue.Queue = queue.Queue()
 
     def _run_agent():
-        _progress_queue.set(q)  # ContextVar不会跨线程自动传播，要在新线程内部重新设置
         try:
             for mode, chunk in _get_agent().stream(
                 {"messages": history},
@@ -376,11 +360,6 @@ def stream_chat(stored_messages: list[dict], user_message: str):
             _, exc = item
             yield {"type": "error", "message": str(exc)}
             return
-
-        if kind == "progress":
-            _, stage = item
-            yield {"type": "progress", "stage": stage}
-            continue
 
         # kind == "event"：item是("event", mode, chunk)，跟原来for循环里拿到的一样
         _, mode, chunk = item

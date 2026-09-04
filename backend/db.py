@@ -237,6 +237,57 @@ class CaseAuditLog(Base):
         }
 
 
+class BackgroundJob(Base):
+    """三类慢LLM操作共用的后台任务记录：案例生成(generate)、知识点匹配(match_knowledge)、
+    用已采纳知识点补充案例(enrich)。
+
+    跟各业务表自己的status字段是两回事——Case.status是"草稿/待审核/已采纳/已驳回"这种
+    人工审核工作流状态，CaseKnowledgeMapping.status是"推荐/已采纳/已拒绝"，都是业务语义；
+    这里的status只表示"这次后台任务跑到哪一步了"。实际业务结果（新案例行、知识点关联行、
+    案例字段更新）仍然写在各自的业务表里，这张表不重复存一份业务数据，只做任务跟踪，
+    所以任务记录就算丢了/被清理了也不影响已经产出的业务数据。"""
+    __tablename__ = "background_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_type = Column(String(20), index=True)  # generate / match_knowledge / enrich
+    case_code = Column(String(20), nullable=True, index=True)  # generate任务：请求生成的基础编号
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)  # match_knowledge/enrich任务：目标案例
+    payload = Column(Text, nullable=True)  # JSON，任务参数（如generate要用的material_ids）
+    status = Column(String(20), default="pending", index=True)  # pending/running/done/failed
+    # 只有generate任务有细分阶段（事实提炼/正文初稿/AI评审(第N轮)/...），其余两类本身就是
+    # 单次LLM调用，没有中间阶段可报，这个字段留空
+    current_stage = Column(String(50), nullable=True)
+    result_case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)  # generate任务：产出的新案例
+    error = Column(Text, nullable=True)
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    # case_id和result_case_id都指向cases表，SQLAlchemy没法自己判断该按哪个外键做join，
+    # 必须显式用foreign_keys指定，否则建映射时就会报AmbiguousForeignKeysError
+    case = relationship("Case", foreign_keys=[case_id])
+    result_case = relationship("Case", foreign_keys=[result_case_id])
+
+    def to_dict(self, include_result_case: bool = False):
+        d = {
+            "id": self.id,
+            "job_type": self.job_type,
+            "case_code": self.case_code,
+            "case_id": self.case_id,
+            "status": self.status,
+            "current_stage": self.current_stage,
+            "result_case_id": self.result_case_id,
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        # 完整案例内容体积不小（正文2000+字），列表接口每8秒轮询一次不该每次都带上，
+        # 只有查单个任务详情时才按需带
+        if include_result_case and self.result_case:
+            d["result_case"] = self.result_case.to_dict()
+        return d
+
+
 class User(Base):
     """登录账号。现在只有一个固定的admin账号，但按多用户设计——以后加新用户只是插入
     一行数据，不用改代码或表结构。"""

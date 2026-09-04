@@ -1,0 +1,64 @@
+# 构建上下文是仓库根目录，这里排除掉不需要进镜像的东西：
+# 一是减小上下文体积（上下文要整个打包发给 docker daemon，大了每次构建都慢），
+# 二是防止密钥/本地数据被意外打进镜像层（镜像层是可以被逐层扒出来看的）
+
+# 版本控制
+.git
+.gitignore
+.github
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+**/.venv/
+venv/
+
+# 【安全】机密文件绝不能进镜像。生产用 compose 的 env_file 在运行时注入，
+# .env.example 是模板不含真实值，但也没必要打进去
+.env
+**/.env
+*.env
+!**/.env.example
+
+# 数据目录：生产数据和本地开发数据都是绑定挂载进容器的，不是镜像内容
+data/
+.local-data/
+volumes/
+
+# 本地遗留的 SQLite 原型库，现在全部走 MySQL，用不上了
+*.db
+backend/sizheng_cases.db
+
+# 证书：运行时挂载，打进镜像等于把私钥发布出去
+certs/
+**/certs/
+*.crt
+*.key
+*.pem
+
+# 文档/说明，不影响运行
+*.md
+!backend/*.md
+
+# 编辑器/系统
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# 测试与临时文件
+test_*.py
+*_test.py
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 部署脚本（在宿主机上跑，不需要进容器）
+deploy/setup_swap.sh
+
+# 前端镜像不需要后端代码，后端镜像不需要前端——但两个 Dockerfile 共用一个上下文，
+# 这里不做交叉排除，靠各自 Dockerfile 里精确的 COPY 路径控制实际进镜像的内容

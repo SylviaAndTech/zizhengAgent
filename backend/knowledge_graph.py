@@ -27,6 +27,9 @@ from db import Case, CaseKnowledgeMapping
 
 plt.rcParams["font.sans-serif"] = [
     "PingFang SC", "Hiragino Sans GB", "Arial Unicode MS", "SimHei", "Microsoft YaHei",
+    # 前面几个是macOS/Windows自带字体名，Linux容器里都找不到；Docker镜像里装了fonts-noto-cjk，
+    # 加这两个作为兜底，不然部署到Linux服务器上导出的图会看到中文变成方块/乱码
+    "Noto Sans CJK SC", "WenQuanYi Zen Hei",
 ]
 plt.rcParams["axes.unicode_minus"] = False
 

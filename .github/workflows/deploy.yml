@@ -1,0 +1,138 @@
+# ============================================================================
+# 需要在 GitHub 仓库配置的 Secrets（Settings → Secrets and variables → Actions）
+#
+# 【当前这一步就需要的】
+#   TCR_USERNAME   腾讯云账号ID（纯数字，如 100012345678）
+#                  控制台右上角头像 → 账号信息 → 账号ID
+#   TCR_PASSWORD   镜像仓库的独立登录密码（不是腾讯云账号登录密码！）
+#                  控制台 → 容器镜像服务 → 个人版 → 实例信息 → 设置/重置密码
+#                  注：ccr.ccs.tencentyun.com 是个人版地址，没有"长期访问凭证"功能，
+#                      那是企业版 TCR 才有的。个人版就用账号ID+仓库密码这一组。
+#                      建议设一个别处没用过的独立强密码，泄露了可随时在控制台重置。
+#
+# 【放开最后那步 ssh 部署时才需要的，现在可以先不配】
+#   SSH_HOST       服务器公网 IP 或域名
+#   SSH_USER       登录用户名（如 ubuntu / root）
+#   SSH_KEY        登录用的私钥全文（OpenSSH 格式，含 BEGIN/END 那两行）
+#   SSH_PORT       SSH 端口，默认 22 的话可以不配
+# ============================================================================
+
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  # 允许在 Actions 页面手动触发，方便不改代码也能重新构建一次
+  workflow_dispatch:
+
+env:
+  REGISTRY: ccr.ccs.tencentyun.com
+  NAMESPACE: ideological
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # buildx 提供多平台构建和 GitHub Actions 缓存后端（下面 cache-from/to: type=gha 要靠它）
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Tencent Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.api
+          push: true
+          # 服务器是腾讯云 CVM(x86_64)，只构建 amd64。
+          # 不加这行的话在 arm 机器上触发会构出 arm 镜像，推上去服务器根本跑不起来
+          platforms: linux/amd64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/sizheng-api:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/sizheng-api:latest
+          # 用 GitHub Actions 自带的缓存存放构建层：api 镜像要装 tesseract、中文字体、
+          # 一大堆 Python 依赖还有 Chromium，冷构建十几分钟，命中缓存能省掉绝大部分。
+          # scope 分开是因为两个镜像的层完全不同，共用一个 scope 会互相挤占
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Build and push Web image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.web
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/sizheng-web:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/sizheng-web:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+
+      - name: Summary
+        run: |
+          echo "### 镜像已推送 :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.NAMESPACE }}/sizheng-api:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.NAMESPACE }}/sizheng-web:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "在服务器上部署这个版本：" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "cd ~/prototype/app" >> $GITHUB_STEP_SUMMARY
+          echo "export TAG=${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "docker compose pull && docker compose up -d --force-recreate" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "> --force-recreate 是必须的：nginx 会缓存 api 的 IP，只重建 api 会导致持续 502" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================================================
+  # 【第二次验证时再放开】自动部署到服务器
+  #
+  # 按你的要求先整段注释掉，分两次验证：
+  #   第一次：只验证镜像能正常构建并推到 TCR（上面的 job 跑通即可）
+  #   第二次：确认服务器上 appnet 网络、infra 容器、app/.env、app/certs 都就位后，
+  #          把下面整段的注释去掉，并补配 SSH_* 那几个 secrets
+  #
+  # 放开前请确认服务器上已完成：
+  #   docker network create appnet
+  #   cd ~/prototype/infra && cp .env.example .env && 改好密码 && docker compose up -d
+  #   cd ~/prototype/app   && cp .env.example .env && 改好密码 && 放好 certs/
+  # ==========================================================================
+  #
+  # deploy:
+  #   needs: build-and-push
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Deploy to server over SSH
+  #       uses: appleboy/ssh-action@v1.0.3
+  #       with:
+  #         host: ${{ secrets.SSH_HOST }}
+  #         username: ${{ secrets.SSH_USER }}
+  #         key: ${{ secrets.SSH_KEY }}
+  #         port: ${{ secrets.SSH_PORT }}
+  #         script: |
+  #           set -e
+  #           cd ~/prototype/app
+  #           # 用 commit sha 而不是 latest：这次部署的到底是哪个版本是确定的，
+  #           # 出问题可以用上一个 sha 精确回滚
+  #           export TAG=${{ github.sha }}
+  #           echo "${{ secrets.TCR_PASSWORD }}" | docker login ccr.ccs.tencentyun.com \
+  #             -u "${{ secrets.TCR_USERNAME }}" --password-stdin
+  #           docker compose pull
+  #           # --force-recreate 不能省：nginx 在配置加载时就把 api 解析成 IP 并缓存住，
+  #           # 只重建 api 的话它会拿到新 IP 而 nginx 还打旧 IP，导致持续 502（实测复现过）
+  #           docker compose up -d --force-recreate
+  #           # 清理旧镜像，避免服务器磁盘被历史版本占满
+  #           docker image prune -f
+  #           docker compose ps
+  #           # 冒烟自检：部署完直接验证一下服务真的通了，不通就让这次 workflow 失败报红
+  #           sleep 15
+  #           curl -fsS http://localhost/api/health || (echo "健康检查失败！" && exit 1)
