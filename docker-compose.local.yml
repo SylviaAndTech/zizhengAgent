@@ -102,6 +102,10 @@ services:
       # 用不含 SSL 的配置覆盖镜像里那份生产配置。挂载而不是重新构建镜像，
       # 是为了让本地和生产共用同一个 Dockerfile.web，不搞两套构建
       - ./deploy/nginx.local.conf:/etc/nginx/conf.d/default.conf:ro
+      # 前端页面也挂载进来：Dockerfile.web 是在构建时把 index.html 打进镜像的，
+      # 不挂载的话本地改一行前端就得重新 build 一次镜像才能看到效果。
+      # 挂载后改完存盘、刷新浏览器就生效（生产环境不挂，用镜像里那份，保证不可变）
+      - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
     depends_on:
       api:
         condition: service_healthy

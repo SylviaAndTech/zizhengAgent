@@ -33,8 +33,8 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)  # pool_pre_ping避免M
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# 五维度固定值，对应大纲第二至六章
-DIMENSIONS = ["政治认同", "家国情怀", "文化素养", "宪法法治意识", "道德修养"]
+# 六个课程思政维度，对应成书的第二至七章（"科学精神"是后加的，原来包含在"文化素养"里）
+DIMENSIONS = ["政治认同", "家国情怀", "文化素养", "科学精神", "宪法法治意识", "道德修养"]
 
 
 class RawMaterial(Base):
@@ -62,16 +62,17 @@ class Case(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     case_code = Column(String(20), index=True)  # 如 "3.4"
-    dimension = Column(String(20))  # 五维度之一
+    dimension = Column(String(20))  # 六个思政维度之一（案例在书里归属的章节）
     title = Column(Text)  # 生成的案例标题（要求不能与网上原文重复）
 
     # 以下字段存 JSON 字符串，简化SQLite schema，读取时用 json.loads
     full_narrative = Column(Text)          # 完整案例（去AI味改写后的定稿，故事化叙述，含句级引用标注）
     full_narrative_draft = Column(Text)    # 去AI味改写之前的正文初稿，跟full_narrative一起给用户对照查看
     teaching_objectives = Column(Text)     # 案例教学目标 {"知识":..,"能力":..,"素养":..}
-    sizheng_elements = Column(Text)        # 课程思政元素，按五维度摘录 {dimension: text}
+    sizheng_elements = Column(Text)        # 课程思政元素分析 {"对应维度", "总述", "维度阐述": {维度: 一段话}}，只含案例体现了的维度，见prompts.SIZHENG_ANALYSIS_SYSTEM_PROMPT
     applicable_courses = Column(Text)      # 适用课程举例 [{课程名称,适用章节,融入方式建议,知识点简述}]
     teaching_design = Column(Text)         # 教学设计 {"课前":..,"课中":..,"课后":..}
+    discussion_questions = Column(Text)    # 思考与讨论（学生读完案例后思考的问题）["问题1", "问题2", ...]
     evaluation = Column(Text)              # 课程评价与成效 {"达成度":..,"参与度":..,"教学反思":..}
     further_reading = Column(Text)         # 延伸阅读 [{"type":..,"title":..,"url":..}]
 
@@ -106,6 +107,7 @@ class Case(Base):
             "sizheng_elements": _load(self.sizheng_elements),
             "applicable_courses": _load(self.applicable_courses),
             "teaching_design": _load(self.teaching_design),
+            "discussion_questions": _load(self.discussion_questions),
             "evaluation": _load(self.evaluation),
             "further_reading": _load(self.further_reading),
             "status": self.status,
@@ -175,7 +177,18 @@ class CaseKnowledgeMapping(Base):
     knowledge_point_id = Column(Integer, ForeignKey("knowledge_points.id"))
     relevance_score = Column(Integer, default=0)  # 0-100，基于字符相似度的粗略打分
     suggestion_text = Column(Text, nullable=True)  # 融入方式建议，可人工编辑
-    status = Column(String(20), default="推荐")  # 推荐/已采纳/已拒绝
+    # 推荐/已采纳/已拒绝/不适用：已拒绝=在匹配页手动拒绝，不适用=在知识点库里解绑；
+    # 这两种跟已采纳一样都算"已有决定"，重新运行匹配时不会再被推荐出来
+    status = Column(String(20), default="推荐")
+    # 运行匹配时按"相关度>50、最多N条"规则自动采纳的；用户手动改过状态就清掉
+    auto_accepted = Column(Boolean, default=False, nullable=False)
+    # 这条知识点是否已经写进了案例的"适用课程举例"（由"补充"同步操作维护）。
+    # 跟status是两回事：采纳/取消采纳只改status，点"补充"按钮同步后bound才跟着变；
+    # 知识点库里的"关联案例"按这个字段展示
+    bound = Column(Boolean, default=False, nullable=False)
+    # 知识图谱里这条知识点要显示的节点：从知识点描述里挑出的跟案例最相关的1~3条原文条目，
+    # JSON数组；写入案例时提取一次（见kp_points.py），为空时画图用兜底规则
+    graph_points = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -193,6 +206,9 @@ class CaseKnowledgeMapping(Base):
             "relevance_score": self.relevance_score,
             "suggestion_text": self.suggestion_text,
             "status": self.status,
+            "auto_accepted": bool(self.auto_accepted),
+            "bound": bool(self.bound),
+            "graph_points": json.loads(self.graph_points) if self.graph_points else None,
         }
 
 
@@ -322,6 +338,9 @@ def init_db():
     _migrate_add_full_narrative_draft()
     _migrate_add_topic_keywords()
     _migrate_messages_to_longtext()
+    _migrate_add_mapping_flags()
+    _migrate_add_graph_points()
+    _migrate_add_discussion_questions()
     _seed_default_admin()
 
 
@@ -371,6 +390,43 @@ def _migrate_messages_to_longtext():
             conn.execute(text("ALTER TABLE chat_sessions MODIFY COLUMN messages LONGTEXT"))
     except Exception as e:
         logging.getLogger("uvicorn.error").warning(f"chat_sessions.messages列类型迁移失败（不影响启动）: {e}")
+
+
+def _migrate_add_mapping_flags():
+    """给case_knowledge_mappings补auto_accepted/bound两列；已存在时ALTER报错，用try/except
+    吞掉，跟上面几个迁移一样的写法。
+
+    只在列刚加上的这一次回填bound：旧逻辑是"已采纳集合一变就把适用课程举例整体重新生成"，
+    所以案例的适用课程举例非空时，它当前的已采纳关联就是已经写进去的那些，直接标成已绑定。
+    放在ADD COLUMN成功之后同一个事务里，列已存在（之前跑过）时整段跳过，不会反复回填"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE case_knowledge_mappings ADD COLUMN auto_accepted BOOLEAN NOT NULL DEFAULT 0"))
+            conn.execute(text("ALTER TABLE case_knowledge_mappings ADD COLUMN bound BOOLEAN NOT NULL DEFAULT 0"))
+            conn.execute(text(
+                "UPDATE case_knowledge_mappings m JOIN cases c ON c.id = m.case_id "
+                "SET m.bound = 1 WHERE m.status = '已采纳' AND c.applicable_courses IS NOT NULL"
+            ))
+    except Exception as e:
+        logging.getLogger("uvicorn.error").info(f"case_knowledge_mappings标记列已存在或迁移失败（不影响启动）: {e}")
+
+
+def _migrate_add_discussion_questions():
+    """给cases补discussion_questions列；已存在时ALTER报错，用try/except吞掉"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cases ADD COLUMN discussion_questions TEXT"))
+    except Exception as e:
+        logging.getLogger("uvicorn.error").info(f"discussion_questions列已存在或迁移失败（不影响启动）: {e}")
+
+
+def _migrate_add_graph_points():
+    """给case_knowledge_mappings补graph_points列；已存在时ALTER报错，用try/except吞掉"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE case_knowledge_mappings ADD COLUMN graph_points TEXT"))
+    except Exception as e:
+        logging.getLogger("uvicorn.error").info(f"graph_points列已存在或迁移失败（不影响启动）: {e}")
 
 
 def _migrate_add_topic_keywords():

@@ -1,142 +1,238 @@
 """
-知识图谱：基于"已采纳"状态的案例、以及案例已采纳的知识点关联，构建 案例↔知识点 两层关系图，
-导出静态图片或可交互HTML。
+知识图谱：两种
+1. 单个案例的知识图谱：案例 → 课程 → 章节 → 知识点，显示在案例详情"④ 适用课程举例"里（横向树状），
+   也嵌进导出的Word里该案例的"适用课程举例"部分。
+2. 汇总知识图谱：思政维度 → 案例 → 课程 → 章节 → 知识点，覆盖全部"已采纳"（审核通过）的案例，
+   页面上"知识图谱"卡片查看，也放在"导出成书"Word的最后一部分。
 
-节点/关系用 langchain_community.graphs.graph_document 里的 Node/Relationship/GraphDocument
-表示——这是LangChain的LLMGraphTransformer的标准输出schema，这里借用同一套数据结构来表达图，
-但不实际调用LLM：案例和知识点的关联本来就是CaseKnowledgeMapping表里已经确定的结构化数据，
-不需要（也不应该）靠LLM从文本里再"猜"一遍已经明确知道的关系。
+数据都直接取自数据库里"已写入案例"（CaseKnowledgeMapping.bound）的知识点关联，课程名/章节/
+知识点描述都是知识点库里的原文——不用案例"适用课程举例"里模型写的"课程名称/适用章节"
+文字：那是模型生成的，偶尔会把整段教学内容塞进"适用章节"里，拿来画图会很乱。
 
-知识点节点的显示名称（课程名+章节）经常很长，图上全量显示会让节点互相压字、很难看清，
-所以knowledge point节点的label会截断成短名字；截断前的完整名字放进节点属性里，可交互HTML
-版本用pyvis原生支持的title属性做hover提示（vis.js的label和title是两个独立属性，鼠标悬停
-才显示title，不用额外写JS）；静态PNG是一张位图，没有"悬停"这回事，只能一直显示截断后的
-短名字，这是PNG这个媒介本身的局限，不是遗漏。
+图本身用Mermaid横向树（graph LR）表示：同一份定义字符串，页面上用mermaid.js直接渲染，
+导出Word时用mermaid_render（无头浏览器）渲染成PNG，两边是同一张图。可交互版本用pyvis
+（vis.js）的分层布局，节点可以拖拽，层次跟Mermaid树一致。
+
+文字完整呈现：节点里的文字一律不截断，过长的按固定字数手动换行（Mermaid不会自动给节点内
+文字换行，文字多长节点就撑多宽）。
+
+知识点节点不是整段知识点描述，而是从描述里挑出的跟案例最相关的1~5条原文条目，每条一个
+节点，挂在所属章节（知识单元）节点下面（见kp_points.py）。
 """
-import io
+import json
+import re
 
-import matplotlib
-matplotlib.use("Agg")  # 无GUI环境下渲染，不依赖系统显示后端
-import matplotlib.pyplot as plt
-import networkx as nx
 from pyvis.network import Network
-from langchain_community.graphs.graph_document import Node, Relationship, GraphDocument
-from langchain_core.documents import Document
 
-from db import Case, CaseKnowledgeMapping
+from db import Case, CaseKnowledgeMapping, DIMENSIONS
+from kp_points import fallback_points
 
-plt.rcParams["font.sans-serif"] = [
-    "PingFang SC", "Hiragino Sans GB", "Arial Unicode MS", "SimHei", "Microsoft YaHei",
-    # 前面几个是macOS/Windows自带字体名，Linux容器里都找不到；Docker镜像里装了fonts-noto-cjk，
-    # 加这两个作为兜底，不然部署到Linux服务器上导出的图会看到中文变成方块/乱码
-    "Noto Sans CJK SC", "WenQuanYi Zen Hei",
-]
-plt.rcParams["axes.unicode_minus"] = False
+# 会破坏Mermaid语法（双引号、方括号）或被当成HTML标签（尖括号）的字符，换成对应的全角
+# 字符——不能直接删掉，要求文字完整呈现
+_ESC_TABLE = str.maketrans({'"': "＂", "[": "［", "]": "］", "<": "＜", ">": "＞"})
+_NEWLINE_RE = re.compile(r"\s*\n+\s*")
 
-NODE_COLORS = {
-    "Case": "#c17817",
-    "KnowledgePoint": "#3a7d44",
+# 各层节点每行字数
+WRAP = {"dimension": 8, "case": 16, "course": 14, "chapter": 18, "kp": 24}
+
+# 所有节点都是浅色底、深色字，各层用不同色系区分
+LAYER_STYLE = {  # 层 -> (底色, 边框, 文字)
+    "dimension": ("#FDECEC", "#F19A9D", "#8F1F23"),
+    "case": ("#EEF2FF", "#6366F1", "#312E81"),
+    "course": ("#E0F2FE", "#38BDF8", "#075985"),
+    "chapter": ("#FFFBEB", "#FCD34D", "#78350F"),
+    "kp": ("#F0FDF4", "#86EFAC", "#14532D"),
 }
+_CLASS_NAMES = {"dimension": "dimNode", "case": "caseNode", "course": "courseNode",
+                "chapter": "chapterNode", "kp": "kpNode"}
+CLASS_DEFS = [
+    f"classDef {_CLASS_NAMES[layer]} fill:{fill},stroke:{stroke},stroke-width:1px,color:{color},rx:4px,ry:4px;"
+    for layer, (fill, stroke, color) in LAYER_STYLE.items()
+]
 
-KP_LABEL_MAX_LEN = 12  # 知识点显示名称的截断长度；案例名称不截断，按要求完整显示
+# 每个知识单元（章节）在图上最多几个知识点节点
+MAX_POINTS_PER_CHAPTER = 5
+
+# 图的版式（字号、间距、连线形状）统一在mermaid_render.MERMAID_CONFIG里，页面和导出共用
+# 树状图不需要箭头（层级从左到右已经表达了方向），用不带箭头的细线，看着更干净
+EDGE_STYLE = "linkStyle default stroke:#94A3B8,stroke-width:1px;"
 
 
-def build_graph_document(db) -> GraphDocument:
-    """
-    只纳入"已采纳"状态的案例、以及它们"已采纳"的知识点关联——
-    图谱反映的应该是审核通过的成果，不是一堆待定的草稿和推荐。
-    """
-    nodes: dict[str, Node] = {}
-    relationships: list[Relationship] = []
+def _header() -> list[str]:
+    return ["graph LR", *CLASS_DEFS]
 
-    cases = db.query(Case).filter(Case.status == "已采纳").all()
-    for c in cases:
-        case_id = f"case:{c.id}"
-        full_label = f"{c.case_code} {c.title or ''}".strip()
-        nodes[case_id] = Node(
-            id=case_id, type="Case",
-            properties={"label": full_label, "full_label": full_label},
-        )
 
-    mappings = (
-        db.query(CaseKnowledgeMapping)
-        .filter(CaseKnowledgeMapping.status == "已采纳")
+def _wrap_lines(text, width: int) -> list[str]:
+    """按字数切行（不截断），原文里的换行保留"""
+    lines = []
+    for seg in _NEWLINE_RE.split(str(text or "").strip()):
+        lines.extend(seg[i:i + width] for i in range(0, len(seg), width))
+    return lines or [""]
+
+
+def _label(text, width: int) -> str:
+    """Mermaid节点标签：去掉会破坏语法/被当成HTML的字符，按字数换行成<br/>"""
+    return "<br/>".join(line.translate(_ESC_TABLE) for line in _wrap_lines(text, width))
+
+
+def _mapping_points(m) -> list[str]:
+    """这条关联在图谱里显示的知识点：写入案例时提取好的结果，还没提取过就用兜底规则"""
+    if m.graph_points:
+        try:
+            points = json.loads(m.graph_points)
+            if isinstance(points, list) and points:
+                return [str(p) for p in points]
+        except ValueError:
+            pass
+    return fallback_points(m.knowledge_point.description)
+
+
+# ---------- 取数 ----------
+
+def case_course_groups(db, case_id: int) -> list[tuple[str, list]]:
+    """某个案例已写入的知识点，按课程、章节（知识单元）两级分组：
+    [(课程名, [(章节名, [知识点, ...]), ...]), ...]。课程、章节都按其中最高相关度排序；
+    每个章节最多MAX_POINTS_PER_CHAPTER个知识点——同一课程下同名的章节（比如不同大纲文件里
+    都有"第一章"）会合并成一个章节节点，合起来也不超过上限"""
+    mappings = [
+        m for m in db.query(CaseKnowledgeMapping)
+        .filter(CaseKnowledgeMapping.case_id == case_id, CaseKnowledgeMapping.bound.is_(True))
+        .order_by(CaseKnowledgeMapping.relevance_score.desc())
         .all()
-    )
+        if m.knowledge_point
+    ]
+    groups: dict[str, dict[str, list]] = {}  # 课程 -> {章节: [知识点, ...]}，dict保持插入顺序=相关度顺序
     for m in mappings:
-        case_id = f"case:{m.case_id}"
-        if case_id not in nodes:
-            continue  # 案例本身不是"已采纳"状态，不纳入图谱
         kp = m.knowledge_point
-        if not kp:
-            continue
-        kp_id = f"kp:{kp.id}"
-        full_label = f"{kp.course_name} {(kp.chapter or '')}".strip()
-        short_label = full_label if len(full_label) <= KP_LABEL_MAX_LEN else full_label[:KP_LABEL_MAX_LEN] + "…"
-        if kp_id not in nodes:
-            nodes[kp_id] = Node(
-                id=kp_id, type="KnowledgePoint",
-                properties={"label": short_label, "full_label": full_label},
-            )
-        relationships.append(Relationship(source=nodes[case_id], target=nodes[kp_id], type="COVERS"))
+        points = groups.setdefault(kp.course_name, {}).setdefault(kp.chapter or "(未标注章节)", [])
+        for point in _mapping_points(m):
+            if len(points) >= MAX_POINTS_PER_CHAPTER:
+                break
+            if point not in points:
+                points.append(point)
+    return [(course, list(chapters.items())) for course, chapters in groups.items()]
 
-    return GraphDocument(
-        nodes=list(nodes.values()),
-        relationships=relationships,
-        source=Document(page_content="已采纳案例与已采纳知识点关联"),
+
+def summary_graph_data(db) -> list[tuple[str, list]]:
+    """汇总图谱的数据：[(维度, [(案例, [(课程名, [知识点...])...]), ...]), ...]。
+    只纳入"已采纳"（审核通过）的案例；没有已写入知识点的案例也保留（挂在维度下，没有子节点）"""
+    cases = db.query(Case).filter(Case.status == "已采纳").order_by(Case.case_code).all()
+    by_dim: dict[str, list] = {}
+    for c in cases:
+        by_dim.setdefault(c.dimension or "(未标注维度)", []).append((c, case_course_groups(db, c.id)))
+    order = {d: i for i, d in enumerate(DIMENSIONS)}
+    return sorted(by_dim.items(), key=lambda kv: order.get(kv[0], len(order)))
+
+
+def summary_empty_reason(db) -> str | None:
+    """汇总图谱为空时告诉用户为什么（不然只看到一张空图，不知道该去做什么）"""
+    approved = db.query(Case).filter(Case.status == "已采纳").count()
+    if approved == 0:
+        counts: dict[str, int] = {}
+        for (status,) in db.query(Case.status).all():
+            counts[status] = counts.get(status, 0) + 1
+        detail = "、".join(f"{s}{n}个" for s, n in counts.items()) or "还没有任何案例"
+        return f"当前没有审核通过（已采纳）的案例（{detail}），知识图谱只汇总已采纳的案例。可以在案例库里把审核通过的案例状态改为「已采纳」。"
+    has_bound = (
+        db.query(CaseKnowledgeMapping).join(Case, Case.id == CaseKnowledgeMapping.case_id)
+        .filter(Case.status == "已采纳", CaseKnowledgeMapping.bound.is_(True)).first()
     )
+    if not has_bound:
+        return (f"已有{approved}个已采纳的案例，但它们都还没有写入知识点。请在「知识点匹配」页面采纳知识点，"
+                "再点「补充」按钮写入案例。")
+    return None
 
 
-# 保留旧函数名作为别名，避免调用方还没来得及跟着改名字就直接报错
-build_graph = build_graph_document
+# ---------- Mermaid ----------
+
+def _course_subtree(lines: list, parent_id: str, prefix: str, groups: list):
+    """课程 → 章节 → 知识点 三层"""
+    for ci, (course_name, chapters) in enumerate(groups, start=1):
+        cid = f"{prefix}C{ci}"
+        lines.append(f'{parent_id} --- {cid}["课程：{_label(course_name, WRAP["course"])}"]:::courseNode')
+        for hi, (chapter, points) in enumerate(chapters, start=1):
+            hid = f"{cid}H{hi}"
+            lines.append(f'{cid} --- {hid}["{_label(chapter, WRAP["chapter"])}"]:::chapterNode')
+            for ki, point in enumerate(points, start=1):
+                lines.append(f'{hid} --- {hid}K{ki}["{_label(point, WRAP["kp"])}"]:::kpNode')
 
 
-def _to_networkx(graph_doc: GraphDocument) -> nx.Graph:
-    """GraphDocument只是数据结构，不负责画图；实际渲染还是靠networkx+matplotlib/pyvis，
-    这里做一次轻量转换，把LangChain的Node/Relationship铺进networkx.Graph里"""
-    g = nx.Graph()
-    for n in graph_doc.nodes:
-        g.add_node(
-            n.id,
-            label=n.properties.get("label", n.id),
-            full_label=n.properties.get("full_label", n.id),
-            type=n.type,
+def _case_label(case) -> str:
+    return f'案例 {_label(case.case_code, 20)}<br/>{_label(case.title, WRAP["case"])}'
+
+
+def case_tree_mermaid(db, case) -> str | None:
+    """单个案例的知识图谱（案例 → 课程 → 章节 → 知识点）。还没有写入任何知识点时返回None"""
+    groups = case_course_groups(db, case.id)
+    if not groups:
+        return None
+    lines = [*_header(), f'CASE["{_case_label(case)}"]:::caseNode']
+    _course_subtree(lines, "CASE", "", groups)
+    return "\n".join([*lines, EDGE_STYLE])
+
+
+def summary_mermaid(db, only_dimension: str | None = None) -> str | None:
+    """汇总知识图谱（思政维度 → 案例 → 课程 → 章节 → 知识点）。only_dimension：只画这一个维度
+    （导出Word时按维度分开画，一张图塞下全部维度会长到超出一页，缩小后字看不清）"""
+    data = [(d, items) for d, items in summary_graph_data(db) if only_dimension in (None, d)]
+    if not data:
+        return None
+    lines = _header()
+    for di, (dim, items) in enumerate(data, start=1):
+        did = f"D{di}"
+        lines.append(f'{did}["{_label(dim, WRAP["dimension"])}"]:::dimNode')
+        for xi, (case, groups) in enumerate(items, start=1):
+            xid = f"{did}X{xi}"
+            lines.append(f'{did} --- {xid}["{_case_label(case)}"]:::caseNode')
+            _course_subtree(lines, xid, xid, groups)
+    return "\n".join([*lines, EDGE_STYLE])
+
+
+# ---------- 可交互HTML（pyvis） ----------
+
+def render_summary_html(db) -> str:
+    """汇总知识图谱的可交互版本：vis.js分层布局（从左到右四层），节点可拖拽、可缩放，
+    文字完整显示（按字数换行，不截断）"""
+    net = Network(height="850px", width="100%", bgcolor="#ffffff", font_color="#2b2622",
+                  cdn_resources="in_line", directed=True)
+
+    def add(node_id, text_lines, level, kind):
+        fill, stroke, color = LAYER_STYLE[kind]
+        net.add_node(
+            node_id, label="\n".join(text_lines), level=level, shape="box",
+            color={"background": fill, "border": stroke}, font={"color": color, "size": 12},
+            borderWidth=1, shapeProperties={"borderRadius": 4}, margin=6,
         )
-    for r in graph_doc.relationships:
-        g.add_edge(r.source.id, r.target.id)
-    return g
 
+    reason = summary_empty_reason(db)
+    if reason:
+        add("empty", _wrap_lines(reason, 30), 0, "kp")
+    for di, (dim, items) in enumerate(summary_graph_data(db), start=1):
+        did = f"D{di}"
+        add(did, [dim], 0, "dimension")
+        for xi, (case, groups) in enumerate(items, start=1):
+            xid = f"{did}X{xi}"
+            add(xid, [f"案例 {case.case_code}", *_wrap_lines(case.title, WRAP["case"])], 1, "case")
+            net.add_edge(did, xid)
+            for ci, (course_name, chapters) in enumerate(groups, start=1):
+                cid = f"{xid}C{ci}"
+                add(cid, _wrap_lines(f"课程：{course_name}", WRAP["course"]), 2, "course")
+                net.add_edge(xid, cid)
+                for hi, (chapter, points) in enumerate(chapters, start=1):
+                    hid = f"{cid}H{hi}"
+                    add(hid, _wrap_lines(chapter, WRAP["chapter"]), 3, "chapter")
+                    net.add_edge(cid, hid)
+                    for ki, point in enumerate(points, start=1):
+                        kid = f"{hid}K{ki}"
+                        add(kid, _wrap_lines(point, WRAP["kp"]), 4, "kp")
+                        net.add_edge(hid, kid)
 
-def render_graph_png(graph_doc: GraphDocument) -> bytes:
-    g = _to_networkx(graph_doc)
-    fig, ax = plt.subplots(figsize=(12, 9))
-    if g.number_of_nodes() == 0:
-        ax.text(0.5, 0.5, "还没有已采纳的案例/知识点关联，暂无图谱数据", ha="center", va="center")
-        ax.axis("off")
-    else:
-        pos = nx.spring_layout(g, k=0.7, seed=42)
-        colors = [NODE_COLORS.get(g.nodes[n]["type"], "#888") for n in g.nodes]
-        labels = {n: g.nodes[n]["label"] for n in g.nodes}  # 静态图没法hover，只能一直显示截断后的短名字
-        nx.draw_networkx_edges(g, pos, ax=ax, edge_color="#ccc")
-        nx.draw_networkx_nodes(g, pos, ax=ax, node_color=colors, node_size=900)
-        nx.draw_networkx_labels(g, pos, labels, ax=ax, font_size=8)
-        ax.axis("off")
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def render_graph_html(graph_doc: GraphDocument) -> str:
-    g = _to_networkx(graph_doc)
-    net = Network(height="750px", width="100%", bgcolor="#ffffff", font_color="#2b2622", cdn_resources="in_line")
-    for n, data in g.nodes(data=True):
-        # label是节点上直接显示的文字（知识点节点是截断后的短名字，案例节点是完整名字）；
-        # title是鼠标hover时弹出的提示条，放完整名字——vis.js原生支持这两个独立属性，不用额外写JS
-        net.add_node(n, label=data["label"], title=data["full_label"], color=NODE_COLORS.get(data["type"], "#888"))
-    for u, v in g.edges():
-        net.add_edge(u, v)
-    net.repulsion(node_distance=180, spring_length=180)
+    net.set_options("""{
+      "layout": {"hierarchical": {"enabled": true, "direction": "LR", "sortMethod": "directed",
+                                  "levelSeparation": 240, "nodeSpacing": 18, "treeSpacing": 30}},
+      "physics": {"enabled": false},
+      "edges": {"arrows": {"to": {"enabled": false}}, "color": "#94A3B8", "width": 1,
+                "smooth": {"type": "cubicBezier", "forceDirection": "horizontal", "roundness": 0.4}},
+      "interaction": {"dragNodes": true, "zoomView": true, "dragView": true}
+    }""")
     return net.generate_html(notebook=False)

@@ -30,18 +30,17 @@ from fetch_material import fetch_url_text
 from parse_document import parse_uploaded_document
 from knowledge_matching import (
     extract_knowledge_points, index_knowledge_point,
-    reindex_knowledge_point, remove_knowledge_point_from_index,
+    reindex_knowledge_point, remove_knowledge_point_from_index, remove_points_from_case,
 )
 from job_queue import (
     submit_generate_job, submit_match_knowledge_job, submit_enrich_job,
-    reset_stale_jobs_on_startup,
+    reset_stale_jobs_on_startup, case_has_active_content_job, submit_sizheng_job, submit_discussion_job,
 )
 from chat_agent import stream_chat
 from audit import log_case_change
 from doc_writer import write_case_section, set_default_font
-from mermaid_tree import build_applicable_courses_mermaid
-from mermaid_render import render_mermaid_batch
-from knowledge_graph import build_graph, render_graph_png, render_graph_html
+from mermaid_render import render_mermaid_batch, MERMAID_CONFIG
+from knowledge_graph import case_tree_mermaid, summary_mermaid, summary_empty_reason, render_summary_html
 from book_export import build_book_docx
 from material_index import index_material
 
@@ -173,6 +172,7 @@ class UpdateCaseRequest(BaseModel):
     sizheng_elements: dict | None = None
     applicable_courses: list | None = None
     teaching_design: dict | None = None
+    discussion_questions: list | None = None
     further_reading: list | None = None
     status: str | None = None
 
@@ -473,14 +473,26 @@ def get_case_materials(case_id: int, db: Session = Depends(get_db)):
     return {"materials": materials}
 
 
+def _ensure_case_not_locked(db: Session, case: Case):
+    """内容正在后台更新（适用课程举例/教学设计、课程思政元素分析）的案例不允许人工修改（编辑、删除），只能查看，
+    见job_queue.case_has_active_content_job。前端也会把编辑入口置灰，这里是兜底"""
+    if case_has_active_content_job(db, case.id):
+        raise HTTPException(409, f"案例{case.case_code}的内容正在后台更新，完成前不能修改，请稍后再试")
+
+
 @app.put("/cases/{case_id}")
 def update_case(case_id: int, req: UpdateCaseRequest, db: Session = Depends(get_db)):
     """人工编辑/审核通过案例"""
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
         raise HTTPException(404, "案例不存在")
+    _ensure_case_not_locked(db, case)
 
     update_data = req.model_dump(exclude_unset=True)
+    # 课程思政元素里的"所属维度"就是案例在书里归属的章节（Case.dimension），两处保持一致
+    new_dim = (update_data.get("sizheng_elements") or {}).get("对应维度")
+    if new_dim in DIMENSIONS:
+        update_data["dimension"] = new_dim
     changes = {}
     for field, value in update_data.items():
         old_value = getattr(case, field, None)
@@ -498,10 +510,17 @@ def update_case(case_id: int, req: UpdateCaseRequest, db: Session = Depends(get_
 
 @app.delete("/cases/{case_id}")
 def delete_case(case_id: int, db: Session = Depends(get_db)):
-    """删除一个案例；连带清掉它的证据链关联、知识点关联建议、修改记录，避免留下悬空外键"""
+    """删除一个案例；连带清掉它的证据链关联、知识点关联建议、修改记录，避免留下悬空外键。
+    后台任务记录（background_jobs）有两个外键指向案例，不清掉的话数据库会拒绝删除；任务记录
+    是历史记录，不跟着删，只把指向这个案例的引用置空（任务里另存了case_code，历史仍看得懂）"""
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
         raise HTTPException(404, "案例不存在")
+    _ensure_case_not_locked(db, case)
+    db.query(BackgroundJob).filter(BackgroundJob.case_id == case_id).update(
+        {BackgroundJob.case_id: None}, synchronize_session=False)
+    db.query(BackgroundJob).filter(BackgroundJob.result_case_id == case_id).update(
+        {BackgroundJob.result_case_id: None}, synchronize_session=False)
     db.query(CaseMaterial).filter(CaseMaterial.case_id == case_id).delete()
     db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.case_id == case_id).delete()
     db.query(CaseAuditLog).filter(CaseAuditLog.case_id == case_id).delete()
@@ -535,7 +554,7 @@ def export_cases(req: ExportCasesRequest, db: Session = Depends(get_db)):
         raise HTTPException(400, "没有找到要导出的案例")
 
     case_dicts = [c.to_dict() for c in cases]
-    tree_pngs = render_mermaid_batch([build_applicable_courses_mermaid(cd) for cd in case_dicts])
+    tree_pngs = render_mermaid_batch([case_tree_mermaid(db, c) for c in cases])
 
     doc = docx.Document()
     set_default_font(doc)
@@ -655,6 +674,7 @@ def upload_knowledge(
     """
     created = []
     errors = []
+    warnings = []  # 解析成功但需要用户核实的信息（比如文件名和文档内课程名称不一致）
     skipped_duplicate_points = 0
 
     for file in files:
@@ -669,7 +689,7 @@ def upload_knowledge(
 
         tmp_path = _save_upload_to_tempfile(file, filename)
         try:
-            detected_course_name, points = extract_knowledge_points(filename, tmp_path, course_name)
+            detected_course_name, points, file_warnings = extract_knowledge_points(filename, tmp_path, course_name)
         except Exception as e:
             errors.append(f"{filename}：解析失败 {str(e)}")
             continue
@@ -679,6 +699,7 @@ def upload_knowledge(
         if not points:
             errors.append(f"{filename}：没有提取到可用的知识点条目")
             continue
+        warnings.extend(file_warnings)
 
         for p in points:
             # 同一门课程、同一章节下，知识点描述完全一样就不重复入库
@@ -727,7 +748,7 @@ def upload_knowledge(
         raise HTTPException(400, "；".join(errors))
 
     return {
-        "imported": created, "count": len(created), "errors": errors,
+        "imported": created, "count": len(created), "errors": errors, "warnings": warnings,
         "skipped_duplicate_points": skipped_duplicate_points,
     }
 
@@ -766,15 +787,17 @@ def list_knowledge(
     point_ids = [k.id for k in points]
     cases_by_point: dict[int, list[dict]] = {pid: [] for pid in point_ids}
     if point_ids:
-        accepted = (
+        # "关联案例"=已经写进案例适用课程举例的（bound），不是单纯状态为已采纳的——采纳了但还
+        # 没点"补充"同步的，案例里还没有这条知识点，不算关联上
+        bound = (
             db.query(CaseKnowledgeMapping)
             .filter(
                 CaseKnowledgeMapping.knowledge_point_id.in_(point_ids),
-                CaseKnowledgeMapping.status == "已采纳",
+                CaseKnowledgeMapping.bound.is_(True),
             )
             .all()
         )
-        for m in accepted:
+        for m in bound:
             if not m.case:
                 continue
             cases_by_point[m.knowledge_point_id].append({
@@ -865,12 +888,65 @@ def _blocking_mappings_detail(db: Session, point_ids: list[int]) -> str | None:
     return (
         "；".join(parts)
         + "。如果确实要删除，可以强制删除——会连同这些案例对应的知识点关联一并解除，"
-        "这些案例会因此缺失对应的知识点关联信息。"
+        "并从案例的适用课程举例中删除对应内容。"
     )
 
 
+def _cases_affected_by_point_deletion(db: Session, point_ids: list[int]) -> dict[int, list]:
+    """强制删除知识点时，哪些案例里已经写入了这些知识点：{case_id: [已绑定的关联, ...]}"""
+    affected: dict[int, list] = {}
+    for m in (
+        db.query(CaseKnowledgeMapping)
+        .filter(CaseKnowledgeMapping.knowledge_point_id.in_(point_ids), CaseKnowledgeMapping.bound.is_(True))
+        .all()
+    ):
+        affected.setdefault(m.case_id, []).append(m)
+    return affected
+
+
+def _ensure_affected_cases_not_locked(db: Session, affected: dict[int, list]):
+    """要在删向量库之前检查：删向量库这一步不能回滚，先删了再发现案例被锁、整个请求报错，
+    就会变成"MySQL里知识点还在、向量库里已经没了"，向量粗筛再也召回不到它"""
+    locked = [
+        m.case.case_code for ms in affected.values() for m in ms[:1]
+        if m.case and case_has_active_content_job(db, m.case_id)
+    ]
+    if locked:
+        raise HTTPException(409, f"案例{'、'.join(locked)}的内容正在后台更新，完成后再删除这些知识点")
+
+
+def _detach_points_from_cases(db: Session, affected: dict[int, list]) -> list[int]:
+    """把要删除的知识点从各案例的适用课程举例里删掉（不调模型，同步执行；跟后面删关联记录、
+    删知识点同一个事务提交）。返回教学设计被清空、需要另起后台任务重新生成的案例id"""
+    needs_td = []
+    for case_id, mappings in affected.items():
+        case = mappings[0].case
+        if not case:
+            continue
+        changes, _summary = remove_points_from_case(db, case, mappings)
+        if changes:
+            db.add(CaseAuditLog(case_id=case.id, actor="删除知识点(自动)",
+                                changes=json.dumps(changes, ensure_ascii=False)))
+        remaining = [
+            m for m in db.query(CaseKnowledgeMapping)
+            .filter(CaseKnowledgeMapping.case_id == case.id, CaseKnowledgeMapping.bound.is_(True)).all()
+            if m.knowledge_point_id not in {x.knowledge_point_id for x in mappings}
+        ]
+        if case.teaching_design is None and remaining:
+            needs_td.append(case.id)
+    return needs_td
+
+
+def _submit_teaching_design_jobs(needs_td: list[int], affected: dict[int, list], request: Request) -> dict:
+    """提交事务之后再起后台任务（任务用自己的session读数据，必须能读到已提交的删除结果）。
+    返回给前端的附加字段：受影响的案例数、为了重新生成教学设计提交的任务"""
+    user = getattr(request.state, "user", None)
+    job_ids = [submit_enrich_job(cid, teaching_design_only=True, requested_by=user.id if user else None) for cid in needs_td]
+    return {"affected_cases": len(affected), "enrich_job_ids": job_ids}
+
+
 @app.delete("/knowledge")
-def delete_knowledge_by_course(course_name: str, force: bool = False, db: Session = Depends(get_db)):
+def delete_knowledge_by_course(course_name: str, request: Request, force: bool = False, db: Session = Depends(get_db)):
     """删掉一门课程下的全部知识点（连带向量索引），用于整门课程的大纲要重新导入或者传错课程了的场景。
     force=True 时，如果知识点被某个案例的知识点关联引用着，连同这些关联记录一并删除
     （否则数据库外键约束不允许删除被引用的知识点）"""
@@ -882,6 +958,8 @@ def delete_knowledge_by_course(course_name: str, force: bool = False, db: Sessio
     blocking_detail = _blocking_mappings_detail(db, point_ids)
     if blocking_detail and not force:
         raise HTTPException(409, f"这门课程下有知识点已经被案例引用，无法删除：{blocking_detail}")
+    affected = _cases_affected_by_point_deletion(db, point_ids) if force else {}
+    _ensure_affected_cases_not_locked(db, affected)
 
     # 先删向量库、全部成功了再删MySQL，理由同delete_knowledge_point：避免"MySQL删了、
     # 向量库没删干净"这种不报错的孤儿向量
@@ -899,7 +977,10 @@ def delete_knowledge_by_course(course_name: str, force: bool = False, db: Sessio
         )
 
     removed_mappings = 0
+    needs_td = []
     if force:
+        # 先把这些知识点从案例内容里删掉，再删关联记录——关联记录删了就没法定位案例里对应的行了
+        needs_td = _detach_points_from_cases(db, affected)
         removed_mappings = (
             db.query(CaseKnowledgeMapping)
             .filter(CaseKnowledgeMapping.knowledge_point_id.in_(point_ids))
@@ -908,7 +989,8 @@ def delete_knowledge_by_course(course_name: str, force: bool = False, db: Sessio
 
     db.query(KnowledgePoint).filter(KnowledgePoint.id.in_(point_ids)).delete(synchronize_session=False)
     db.commit()
-    return {"deleted": True, "count": len(point_ids), "removed_mappings": removed_mappings}
+    return {"deleted": True, "count": len(point_ids), "removed_mappings": removed_mappings,
+            **_submit_teaching_design_jobs(needs_td, affected, request)}
 
 
 @app.put("/knowledge/{point_id}")
@@ -939,7 +1021,7 @@ def update_knowledge_point(point_id: int, req: UpdateKnowledgePointRequest, db: 
 
 
 @app.delete("/knowledge/{point_id}")
-def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Depends(get_db)):
+def delete_knowledge_point(point_id: int, request: Request, force: bool = False, db: Session = Depends(get_db)):
     """force=True 时，如果这条知识点被某个案例的知识点关联引用着，连同这条关联记录一并删除"""
     kp = db.query(KnowledgePoint).filter(KnowledgePoint.id == point_id).first()
     if not kp:
@@ -948,6 +1030,8 @@ def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Dep
     blocking_detail = _blocking_mappings_detail(db, [point_id])
     if blocking_detail and not force:
         raise HTTPException(409, f"这条知识点已经被案例引用，无法删除：{blocking_detail}")
+    affected = _cases_affected_by_point_deletion(db, [point_id]) if force else {}
+    _ensure_affected_cases_not_locked(db, affected)
 
     # 先删向量库、成功了再删MySQL：万一向量库这一步失败，整个请求直接报错、MySQL记录
     # 原样保留，用户能看到失败提示并重试；如果反过来先删MySQL再删向量库，向量库这步
@@ -959,7 +1043,9 @@ def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Dep
         raise HTTPException(500, f"知识点(id={point_id})从向量库删除失败，为避免留下孤儿向量，本次删除已取消，可以重试：{e}")
 
     removed_mappings = 0
+    needs_td = []
     if force:
+        needs_td = _detach_points_from_cases(db, affected)  # 理由同delete_knowledge_by_course
         removed_mappings = (
             db.query(CaseKnowledgeMapping)
             .filter(CaseKnowledgeMapping.knowledge_point_id == point_id)
@@ -968,12 +1054,14 @@ def delete_knowledge_point(point_id: int, force: bool = False, db: Session = Dep
 
     db.delete(kp)
     db.commit()
-    return {"deleted": True, "removed_mappings": removed_mappings}
+    return {"deleted": True, "removed_mappings": removed_mappings,
+            **_submit_teaching_design_jobs(needs_td, affected, request)}
 
 
 @app.post("/cases/{case_id}/match_knowledge", status_code=202)
-def match_knowledge(case_id: int, request: Request, db: Session = Depends(get_db)):
+def match_knowledge(case_id: int, request: Request, auto_accept_limit: int = 5, db: Session = Depends(get_db)):
     """提交一个知识点匹配任务（向量+关键词混合粗筛 + LLM复核精排），立刻返回job_id。
+    auto_accept_limit：自动采纳上限N（页面上用户可改，默认5），规则见job_queue._run_match_knowledge。
 
     实际匹配在后台线程池里跑，完成后结果直接写进case_knowledge_mappings表；调用方轮询到
     这个job变成done之后，用 GET /api/cases/{case_id}/knowledge_mappings 读结果即可
@@ -985,8 +1073,11 @@ def match_knowledge(case_id: int, request: Request, db: Session = Depends(get_db
     if db.query(KnowledgePoint).count() == 0:
         raise HTTPException(400, "还没有导入任何知识点，请先在「知识点匹配」标签页上传课程教学大纲")
 
+    if not 0 <= auto_accept_limit <= 50:
+        raise HTTPException(400, "自动采纳上限需在0到50之间")
+
     user = getattr(request.state, "user", None)
-    job_id = submit_match_knowledge_job(case_id, requested_by=user.id if user else None)
+    job_id = submit_match_knowledge_job(case_id, auto_accept_limit, requested_by=user.id if user else None)
     return {"job_id": job_id, "message": "已提交匹配任务，完成后候选列表会自动刷新"}
 
 
@@ -1022,77 +1113,112 @@ def get_knowledge_mappings(case_id: int, db: Session = Depends(get_db)):
     return [m.to_dict() for m in mappings]
 
 
-@app.put("/knowledge_mappings/{mapping_id}")
-def update_mapping(mapping_id: int, req: UpdateMappingRequest, request: Request, db: Session = Depends(get_db)):
-    """人工修改：采纳/拒绝某条知识点关联，或编辑融入方式建议文字。
-    只要这次修改让案例的"已采纳"知识点集合发生了变化（新采纳一条、或者把已采纳的改成别的
-    状态），就自动重新生成一遍"适用课程举例"/"教学设计"。
+MAPPING_STATUSES = ("推荐", "已采纳", "已拒绝", "不适用")
 
-    这个重新生成涉及真实LLM调用（几十秒），所以是提交成后台任务、本接口立刻返回，不再让
-    "改个下拉框状态"这么个小操作卡在一次模型调用上。触发了的话返回体里会多一个
-    enrich_job_id，前端拿它去轮询，完成后再刷新案例内容。"""
+
+@app.put("/knowledge_mappings/{mapping_id}")
+def update_mapping(mapping_id: int, req: UpdateMappingRequest, db: Session = Depends(get_db)):
+    """人工修改：改某条知识点关联的状态，或编辑融入方式建议文字。
+    只改状态，不再自动重新生成案例的"适用课程举例"/"教学设计"——统一由"补充"按钮
+    把案例跟当前已采纳集合做增量同步（见knowledge_matching.sync_case_with_accepted_mappings）。"""
     mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == mapping_id).first()
     if not mapping:
         raise HTTPException(404, "关联记录不存在")
 
-    old_status = mapping.status
     if req.status is not None:
+        if req.status not in MAPPING_STATUSES:
+            raise HTTPException(400, f"状态只能是：{'/'.join(MAPPING_STATUSES)}")
+        if req.status != mapping.status:
+            mapping.auto_accepted = False  # 用户手动改过，就不再算"自动采纳"的
         mapping.status = req.status
     if req.suggestion_text is not None:
         mapping.suggestion_text = req.suggestion_text
     db.commit()
     db.refresh(mapping)
-
-    result = mapping.to_dict()
-    accepted_set_changed = req.status is not None and "已采纳" in (old_status, req.status) and old_status != req.status
-    if accepted_set_changed:
-        user = getattr(request.state, "user", None)
-        result["enrich_job_id"] = submit_enrich_job(
-            mapping.case_id, requested_by=user.id if user else None
-        )
-
-    return result
+    return mapping.to_dict()
 
 
-@app.delete("/knowledge_mappings/{mapping_id}")
-def delete_knowledge_mapping(mapping_id: int, request: Request, db: Session = Depends(get_db)):
-    """解绑一条案例↔知识点关联。如果这条关联当时是"已采纳"状态，解绑后案例的"已采纳"集合
-    也跟着变了，同样要重新生成一遍"适用课程举例"/"教学设计"（如果解绑后已采纳集合空了，
-    这两个字段会被清空，不会留着解绑前的旧内容）——跟PUT那个接口一样走后台任务，
-    返回体里带enrich_job_id给前端轮询。"""
+@app.post("/knowledge_mappings/{mapping_id}/unbind")
+def unbind_knowledge_mapping(mapping_id: int, request: Request, db: Session = Depends(get_db)):
+    """知识点库里解绑一条案例↔知识点关联：状态改成"不适用"（保留记录，以后重新运行匹配
+    也不会再被推荐出来），同时从案例里删掉这条知识点对应的适用课程举例；教学设计正好依据
+    这条知识点时会重新生成（真实LLM调用），所以内容更新走后台任务，返回enrich_job_id给前端轮询。"""
     mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == mapping_id).first()
     if not mapping:
         raise HTTPException(404, "关联记录不存在")
 
-    was_accepted = mapping.status == "已采纳"
-    case_id = mapping.case_id
-    db.delete(mapping)
+    mapping.status = "不适用"
+    mapping.auto_accepted = False
     db.commit()
 
     result = {"unbound": True}
-    if was_accepted:
+    if mapping.bound:
         user = getattr(request.state, "user", None)
-        result["enrich_job_id"] = submit_enrich_job(case_id, requested_by=user.id if user else None)
-
+        result["enrich_job_id"] = submit_enrich_job(
+            mapping.case_id, unbind_mapping_id=mapping.id, requested_by=user.id if user else None
+        )
     return result
 
 
 # ---------- 知识图谱 ----------
 
+@app.post("/cases/{case_id}/regenerate_sizheng", status_code=202)
+def regenerate_sizheng(case_id: int, request: Request, db: Session = Depends(get_db)):
+    """重新生成案例的"课程思政元素分析"（总述+案例体现了的维度各一段论述），所属维度也会跟着重新判断。
+    后台任务，期间案例锁住不能编辑"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "案例不存在")
+    _ensure_case_not_locked(db, case)
+    user = getattr(request.state, "user", None)
+    return {"job_id": submit_sizheng_job(case_id, requested_by=user.id if user else None)}
+
+
+@app.post("/cases/{case_id}/regenerate_discussion", status_code=202)
+def regenerate_discussion(case_id: int, request: Request, db: Session = Depends(get_db)):
+    """重新生成案例的"思考与讨论"。后台任务，期间案例锁住不能编辑"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "案例不存在")
+    _ensure_case_not_locked(db, case)
+    user = getattr(request.state, "user", None)
+    return {"job_id": submit_discussion_job(case_id, requested_by=user.id if user else None)}
+
+
+@app.get("/cases/{case_id}/course_tree")
+def get_case_course_tree(case_id: int, db: Session = Depends(get_db)):
+    """单个案例的知识图谱（案例 → 课程 → 章节 → 知识点）的Mermaid定义，案例详情"适用课程举例"里
+    渲染成横向树。还没有写入任何知识点时definition为null"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "案例不存在")
+    return {"definition": case_tree_mermaid(db, case), "config": MERMAID_CONFIG}
+
+
+@app.get("/knowledge_graph")
+def get_knowledge_graph(db: Session = Depends(get_db)):
+    """汇总知识图谱（思政维度 → 案例 → 课程 → 章节 → 知识点）的Mermaid定义，页面弹窗里直接渲染；
+    只汇总已采纳（审核通过）的案例。没有数据时empty_reason说明原因"""
+    return {"definition": summary_mermaid(db), "empty_reason": summary_empty_reason(db), "config": MERMAID_CONFIG}
+
+
 @app.get("/knowledge_graph.png")
 def get_knowledge_graph_png(db: Session = Depends(get_db)):
-    """维度→案例→知识点 三层关系图的静态图片，只统计已采纳的案例与已采纳的知识点关联"""
-    graph = build_graph(db)
-    png_bytes = render_graph_png(graph)
-    return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+    """汇总知识图谱的PNG（供下载），跟页面上看到的是同一份Mermaid定义"""
+    definition = summary_mermaid(db)
+    if not definition:
+        raise HTTPException(404, summary_empty_reason(db) or "暂无知识图谱数据")
+    png = render_mermaid_batch([definition])[0]
+    if not png:
+        raise HTTPException(503, "图片渲染失败（服务器需要安装Playwright浏览器内核：playwright install chromium）")
+    return StreamingResponse(io.BytesIO(png), media_type="image/png",
+                             headers={"Content-Disposition": "attachment; filename=knowledge_graph.png"})
 
 
 @app.get("/knowledge_graph.html")
 def get_knowledge_graph_html(db: Session = Depends(get_db)):
-    """同一份图谱的可交互HTML版本（可拖拽缩放），单独打开查看"""
-    graph = build_graph(db)
-    html = render_graph_html(graph)
-    return HTMLResponse(content=html)
+    """汇总知识图谱的可交互HTML版本（分层布局，可拖拽缩放），在新标签页打开"""
+    return HTMLResponse(content=render_summary_html(db))
 
 
 # ---------- 成书编译 ----------

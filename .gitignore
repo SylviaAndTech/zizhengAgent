@@ -13,6 +13,9 @@ volumes/
 # 各层 compose 的实际配置（含密码），只提交 .env.example 模板
 app/.env
 infra/.env
+# 根目录 .env：docker compose 会自动读它做变量替换，本地跑 docker-compose.local.yml 时
+# 用来放 DASHSCOPE_API_KEY，绝不能提交
+.env
 
 # TLS 证书私钥，绝不能进版本控制
 app/certs/

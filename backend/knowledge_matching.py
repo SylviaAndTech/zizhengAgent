@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 
 import fitz  # PyMuPDF
 import jieba
@@ -29,6 +30,7 @@ from ocr_utils import doc_is_scanned, native_page_lines, ocr_page_lines
 from parse_document import extract_text_from_docx, extract_text_from_pdf
 from prompts import KNOWLEDGE_MATCH_SYSTEM_PROMPT, build_knowledge_match_prompt
 from qwen_client import get_client, require_api_key, CHAT_MODEL
+from syllabus_docx_table import extract_units_and_points as extract_units_and_points_docx
 from syllabus_table_ocr import extract_units_and_points
 from syllabus_vision_ocr import extract_units_and_points as extract_units_and_points_vision
 
@@ -61,13 +63,26 @@ _BOOK_TITLE_RE = re.compile(r"《([^》]+)》")
 _COURSE_NAME_FIELD_RE = re.compile(r"课程名称?[，,：:]\s*([^/]{2,40}?)(?=/|[0-9]{1,2}[.\、]|$)")
 
 
+def _normalize_cjk_radicals(text: str) -> str:
+    """把康熙部首/部首补充区的字符（U+2E80–U+2FDF）换成对应的常用汉字。
+    有些大纲是从PDF转回Word的，"计算机网络"里的"网"其实是康熙部首"⽹"(U+2F79)，
+    肉眼看不出区别，但存进库里之后按"网络"搜索就搜不到。只转这一段字符，不对整串做
+    NFKC——那样会把全角括号"（Java）"也变成半角，改变课程名原本的写法"""
+    return "".join(
+        unicodedata.normalize("NFKC", ch) if "⺀" <= ch <= "⿟" else ch
+        for ch in text
+    )
+
+
 def _course_name_from_field(blob: str) -> str | None:
     """从"课程名称：xxx"结构化字段里提取课程名，取不到返回None交给调用方走其他猜测方式"""
     m = _COURSE_NAME_FIELD_RE.search(blob)
     if not m:
         return None
-    name = m.group(1).strip(" 　:：，,。")
-    return name or None
+    # 有的大纲把"中文名/英文名"整体用括号括起来："课程名称：（数据结构/data structure）"，
+    # 正则截到"/"为止会剩下一个孤零零的左括号
+    name = m.group(1).strip(" 　:：，,。").lstrip("（(").strip()
+    return _normalize_cjk_radicals(name) or None
 
 
 def guess_course_name(filename: str, lines: list[tuple[str, bool]]) -> str:
@@ -91,6 +106,48 @@ def guess_course_name(filename: str, lines: list[tuple[str, bool]]) -> str:
     base = re.sub(r"\.(docx|pdf)$", "", filename, flags=re.I)
     base = _COURSE_SUFFIX_RE.sub("", base).strip("《》 　:：-_")
     return base or filename
+
+
+# 大纲文件名常见写法："林依天+工业互联网应用系统开发+10830745+2025软件工程V3.docx"、
+# "姚家朋-数据结构-10830401-25计算机科学与技术（专升本）.docx"——教师名、课程名、课程代码、
+# 年级专业用+/-/_拼起来，顺序不固定。下面这些片段肯定不是课程名，剔除后取剩下的第一段
+_FILENAME_SPLIT_RE = re.compile(r"[+＋\-_－—]")
+_FILENAME_NOISE_RE = re.compile(r"^\d+$|^(20)?\d{2}(级|届)?|级|专业|大纲|最终版|新版|^V\d|^[一-龥]{2,3}(任课)?$")
+
+
+def _course_name_from_filename(filename: str) -> str:
+    base = re.sub(r"\.(docx|pdf)$", "", filename, flags=re.I).strip()
+    book_match = _BOOK_TITLE_RE.search(base)
+    if book_match:
+        return book_match.group(1).strip()
+    for seg in _FILENAME_SPLIT_RE.split(base):
+        seg = re.sub(r"\(\d+\)$|（\d+）$", "", seg.strip()).strip()  # "xxx(1).docx"这种副本后缀
+        if seg and not _FILENAME_NOISE_RE.search(seg):
+            return _COURSE_SUFFIX_RE.sub("", seg).strip() or seg
+    return _COURSE_SUFFIX_RE.sub("", base).strip("《》 　:：-_") or filename
+
+
+def _resolve_docx_course_name(course_name_override, filename, lines) -> tuple[str, list[str]]:
+    """Word大纲的课程名：手动填写的优先；否则以正文开头"2.课程名称：xxx/English"字段里
+    的中文名为准，并跟文件名核对——文件名里找不到这个课程名时给出提示让用户核实（文件名
+    是人手动起的，经常是简称、旧名或者干脆写错，正文字段更可信）。正文里没有这个字段时，
+    才退回从文件名提取。返回(课程名, 提示列表)"""
+    if course_name_override and course_name_override.strip():
+        return course_name_override.strip(), []
+
+    from_filename = _course_name_from_filename(filename)
+    from_content = _course_name_from_field("".join(text for text, _ in lines[:20]))
+    if not from_content:
+        return from_filename, [f"{filename}：正文开头没有找到「课程名称」字段，课程名按文件名识别为「{from_filename}」，请核实"]
+
+    def squash(s):
+        return re.sub(r"[\s《》]", "", unicodedata.normalize("NFKC", s)).lower()
+
+    if squash(from_content) in squash(filename):
+        return from_content, []
+    return from_content, [
+        f"{filename}：文件名识别为「{from_filename}」，与文档内课程名称「{from_content}」不一致，已采用「{from_content}」"
+    ]
 
 
 def _resolve_course_name(course_name_override, filename, lines) -> str:
@@ -120,13 +177,17 @@ def _points_from_heading_lines(course_name: str, lines: list[tuple[str, bool]]) 
 
 def extract_knowledge_points(
     filename: str, file_path: str, course_name_override: str | None = None
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], list[str]]:
     """
     file_path: 磁盘上的临时文件路径（调用方负责上传落盘和之后的清理），不是读进内存的bytes——
     大纲PDF/Word体积可能到几百MB，整个读进内存在小内存服务器上容易顶不住。
     course_name_override 非空时直接采用（适合同一门课程分多个文件上传）；
     为空则自动从文档标题/文件名猜课程名（适合一次批量上传多门课程的大纲）。
-    返回 (最终使用的课程名, 知识点列表)
+    返回 (最终使用的课程名, 知识点列表, 需要提示用户核实的信息列表)
+
+    Word(.docx)：先按表格解析"表5-1 知识单元/教学内容"、"表5-2 实验单元/教学内容"
+    （syllabus_docx_table，一个单元一条知识点）；文档里没有这类表格（比如毕业实习大纲）
+    才退回到按标题样式分节的启发式。
 
     PDF分两条路径：
     - 正常数字PDF（有文字层）：先尝试按坐标分列识别"知识单元/教学内容(知识点)"表格
@@ -140,8 +201,22 @@ def extract_knowledge_points(
     lower_name = filename.lower()
     if lower_name.endswith(".docx"):
         lines = extract_text_from_docx(file_path)
-        course_name = _resolve_course_name(course_name_override, filename, lines)
-        return course_name, _points_from_heading_lines(course_name, lines)
+        course_name, warnings = _resolve_docx_course_name(course_name_override, filename, lines)
+        units_points = extract_units_and_points_docx(file_path)
+        if not units_points:
+            return course_name, _points_from_heading_lines(course_name, lines), warnings
+        # 表格路径不按MAX_KP_CHARS过滤：一个单元的教学内容整格照录，偶尔会比较长，
+        # 悄悄丢掉会让这个单元在知识点库里凭空消失，违背"一个单元一条记录"；照常入库，
+        # 只提示一下让用户留意
+        for chapter, description in units_points:
+            if len(description) > MAX_KP_CHARS:
+                warnings.append(f"{filename}：「{chapter}」的教学内容有{len(description)}字，偏长，已完整入库，请留意是否混入了其他内容")
+        points = [
+            {"course_name": course_name, "chapter": chapter, "description": description}
+            for chapter, description in units_points
+            if len(description) >= MIN_KP_CHARS
+        ]
+        return course_name, points, warnings
 
     if not lower_name.endswith(".pdf"):
         raise ValueError("仅支持 .docx 或 .pdf 文件")
@@ -164,7 +239,7 @@ def extract_knowledge_points(
                 for chapter, description in units_points
                 if MIN_KP_CHARS <= len(description) <= MAX_KP_CHARS
             ]
-            return course_name, points
+            return course_name, points, []
 
         # 数字PDF：先试免费的按坐标分列，识别不出表格结构就静默回退到标题分节启发式
         try:
@@ -179,14 +254,14 @@ def extract_knowledge_points(
                 for chapter, description in units_points
                 if MIN_KP_CHARS <= len(description) <= MAX_KP_CHARS
             ]
-            return course_name, points
+            return course_name, points, []
     finally:
         doc.close()
 
     # 非扫描件、且没识别出"知识单元/知识点"表格结构的PDF：退回到原来的标题分节启发式
     lines = extract_text_from_pdf(file_path)
     course_name = _resolve_course_name(course_name_override, filename, lines)
-    return course_name, _points_from_heading_lines(course_name, lines)
+    return course_name, _points_from_heading_lines(course_name, lines), []
 
 
 def _course_name_from_pdf_title(doc, get_page_lines, course_name_override, filename) -> str:
@@ -429,68 +504,236 @@ def match_case_to_knowledge(db, case) -> list[dict]:
     return results[:FINE_TOP_K]
 
 
-def enrich_case_from_accepted_mappings(db, case) -> dict:
-    """
-    案例当前"已采纳"的知识点关联集合发生变化后调用（不管是新采纳了一条、还是取消采纳了
-    一条，都要调这个函数重新算一遍）：
-    - 如果当前一条"已采纳"的关联都没有，"适用课程举例"和"教学设计"清空回"尚未生成"状态
-      （不留旧内容——旧内容对应的知识点可能已经不再是"已采纳"状态了，留着会误导）。
-    - 否则重新生成这两个字段：适用课程举例对已采纳的每一条知识点关联都生成一条；
-      教学设计只结合relevance_score最高的那一条来设计，不是把全部已采纳的糅在一起
-      （多个不相关的知识点糅进一份教学设计里会变得空泛、失焦）。
+# 教学设计只结合一条知识点生成，记下是哪一条，存在teaching_design这个dict里；以后这条知识点
+# 被去掉时才知道教学设计要跟着重新生成，没被去掉就原样保留
+TEACHING_DESIGN_BASIS_KEY = "依据知识点ID"
 
-    调用方负责commit/refresh/写审计日志——这个函数只改case对象的字段值、返回变化了
-    哪些字段（供写审计日志用），不落库、不处理事务边界。
-    返回值：{字段名: {"old":.., "new":..}, ...}，没有实际变化时返回空dict。
-    """
+
+def _load_json(value, default):
+    try:
+        return json.loads(value) if value else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _mapping_payload(m) -> dict:
+    return {
+        "course_name": m.knowledge_point.course_name,
+        "chapter": m.knowledge_point.chapter,
+        "description": m.knowledge_point.description,
+        "suggestion_text": m.suggestion_text,
+        "relevance_score": m.relevance_score,
+    }
+
+
+def _row_matches_mapping(row: dict, m) -> bool:
+    """旧数据的适用课程举例行没有knowledge_point_id，按知识点描述原文（"知识点简述"）
+    认领，再没有就按课程名+章节认领"""
+    kp = m.knowledge_point
+    if row.get("知识点简述"):
+        return row["知识点简述"] == kp.description
+    return (str(row.get("课程名称") or "").strip("《》 ") == kp.course_name
+            and (row.get("适用章节") or None) == kp.chapter)
+
+
+def _attach_row_ids(courses: list, bound_mappings: list) -> None:
+    """给还没有knowledge_point_id的旧行补上ID（一行只认领给一条知识点），之后增删都按ID精确定位"""
+    for m in bound_mappings:
+        if any(r.get("knowledge_point_id") == m.knowledge_point_id for r in courses):
+            continue
+        for r in courses:
+            if r.get("knowledge_point_id") is None and _row_matches_mapping(r, m):
+                r["knowledge_point_id"] = m.knowledge_point_id
+                break
+
+
+def _generate_rows(case, mappings: list) -> tuple[list, dict | None]:
+    """为给定的知识点关联（已按相关度降序）各生成一条适用课程举例，顺带生成一份结合第一条
+    知识点的教学设计。行里的知识点描述原文和ID直接按位置写回，不依赖模型复述
+    （见_kp_embedding_text的注释）——所以模型返回的条数必须跟输入一一对应，对不上宁可
+    报错让用户重试，也不能把行错配到别的知识点上（之后按ID删除时会删错）"""
+    from generate_case import enrich_case_with_knowledge
+
+    enrichment = enrich_case_with_knowledge(case.to_dict(), [_mapping_payload(m) for m in mappings])
+    rows = enrichment.get("applicable_courses")
+    if not isinstance(rows, list) or len(rows) != len(mappings) or not all(isinstance(r, dict) for r in rows):
+        raise ValueError("模型返回的适用课程举例条数与知识点条数对不上，无法逐条对应，请重试")
+    for row, m in zip(rows, mappings):
+        # 课程名称/适用章节也用知识点库原文覆盖：提示词要求模型照抄，但模型偶尔会把整段
+        # 教学内容塞进"适用章节"里
+        row["课程名称"] = m.knowledge_point.course_name
+        row["适用章节"] = m.knowledge_point.chapter or ""
+        row["知识点简述"] = m.knowledge_point.description
+        row["knowledge_point_id"] = m.knowledge_point_id
+    td = enrichment.get("teaching_design")
+    if isinstance(td, dict):
+        td[TEACHING_DESIGN_BASIS_KEY] = mappings[0].knowledge_point_id
+    else:
+        td = None
+    return rows, td
+
+
+def _fill_graph_points(case, mappings: list, on_stage=None) -> int:
+    """给还没提取过知识图谱节点的已写入关联提取一次（见kp_points.py）。提取失败不影响
+    写入案例本身——知识图谱只是展示，画图时会用兜底规则，下次同步再补。返回补上的条数"""
+    from kp_points import extract_graph_points
+
+    pending = [m for m in mappings if m.knowledge_point and not m.graph_points]
+    if not pending:
+        return 0
+    (on_stage or (lambda _msg: None))("提取知识图谱的知识点")
+    try:
+        extracted = extract_graph_points(case, pending)
+    except Exception as e:
+        logger.warning(f"案例{case.id}的知识图谱知识点提取失败，先用兜底规则显示：{e}")
+        return 0
+    for m in pending:
+        if m.id in extracted:
+            m.graph_points = json.dumps(extracted[m.id], ensure_ascii=False)
+    return len(extracted)
+
+
+def _apply_binding_changes(db, case, to_add: list, to_remove: list,
+                           allow_llm: bool = True, on_stage=None) -> tuple[dict, str]:
+    """把to_add里的知识点写进案例、把to_remove里的从案例里删掉，其余已绑定的内容原样不动。
+    allow_llm=False：只做不需要调模型的部分（只能删、不能加），用在强制删除知识点这种在HTTP
+    请求里同步执行的场景；教学设计需要重新生成时先清空，由调用方另起后台任务补
+    （regenerate_missing_teaching_design）。on_stage：调模型前回调一句进度描述，给任务进度条用。
+    - 新增：只为新增的这几条调模型生成适用课程举例，追加在原有行后面
+    - 删除：直接删掉对应的行，不调模型
+    - 教学设计：原样保留；只有它依据的知识点被删掉、或者原本就没有教学设计时，才改用剩下
+      已绑定知识点里相关度最高的那条重新生成；一条绑定都不剩了就清空
+    同时维护每条关联的bound标记。调用方负责commit和写审计日志（中途模型调用失败抛异常时，
+    调用方不commit，bound标记也就跟着回滚，不会出现"标成已绑定、内容却没写进去"）。
+    返回 ({字段名: {"old":.., "new":..}}, 给用户看的一句话结果)"""
     from db import CaseKnowledgeMapping  # 延迟import，避免和db.py出现循环依赖
 
-    accepted = (
-        db.query(CaseKnowledgeMapping)
-        .filter(CaseKnowledgeMapping.case_id == case.id, CaseKnowledgeMapping.status == "已采纳")
-        .order_by(CaseKnowledgeMapping.relevance_score.desc())
-        .all()
-    )
-    accepted_payload = [
-        {
-            "course_name": m.knowledge_point.course_name,
-            "chapter": m.knowledge_point.chapter,
-            "description": m.knowledge_point.description,
-            "suggestion_text": m.suggestion_text,
-            "relevance_score": m.relevance_score,
-        }
-        for m in accepted
+    by_score = lambda m: m.relevance_score or 0  # noqa: E731
+    bound_all = [
+        m for m in db.query(CaseKnowledgeMapping)
+        .filter(CaseKnowledgeMapping.case_id == case.id, CaseKnowledgeMapping.bound.is_(True)).all()
         if m.knowledge_point
     ]
+    to_remove = [m for m in to_remove if m.bound]
+    to_add = sorted((m for m in to_add if not m.bound and m.knowledge_point), key=by_score, reverse=True)
+    remove_ids = {m.knowledge_point_id for m in to_remove}
+    still_bound = [m for m in bound_all if m.knowledge_point_id not in remove_ids]
+    final_bound = still_bound + to_add
+
+    courses = _load_json(case.applicable_courses, [])
+    courses = courses if isinstance(courses, list) else []
+    td = _load_json(case.teaching_design, None)
+    td = td if isinstance(td, dict) and td else None
+
+    _attach_row_ids(courses, bound_all)
+    basis_id = td.get(TEACHING_DESIGN_BASIS_KEY) if td else None
+    if td and basis_id is None and bound_all:
+        # 旧数据没记依据哪条：旧逻辑一直是用相关度最高的那条已采纳知识点生成教学设计
+        basis_id = max(bound_all, key=by_score).knowledge_point_id
+        td[TEACHING_DESIGN_BASIS_KEY] = basis_id
+
+    courses = [r for r in courses if r.get("knowledge_point_id") not in remove_ids]
+    stage = on_stage or (lambda _msg: None)
+    td_note = ""
+    if not final_bound:
+        new_courses, new_td = None, None
+        if td:
+            td_note = "，教学设计已清空"
+    else:
+        new_td = td
+        need_td = td is None or basis_id not in {m.knowledge_point_id for m in still_bound}
+        candidate = max(final_bound, key=by_score)
+        if not allow_llm:
+            if to_add:
+                raise ValueError("allow_llm=False时不能新增知识点")
+            if need_td:
+                new_td, td_note = None, "，教学设计待重新生成"
+                need_td = False
+        if to_add:
+            stage(f"生成新增的{len(to_add)}条适用课程举例")
+            rows, generated_td = _generate_rows(case, to_add)
+            courses.extend(rows)
+            if need_td and candidate is to_add[0]:
+                new_td, need_td = generated_td, False
+                td_note = "，教学设计已重新生成"
+        if need_td:
+            stage("重新生成教学设计")
+            _, new_td = _generate_rows(case, [candidate])  # 只要教学设计，附带生成的那一行丢掉
+            td_note = "，教学设计已重新生成"
+        new_courses = courses
+
+    for m in to_remove:
+        m.bound = False
+        m.graph_points = None  # 以后重新写入时案例内容可能已经变了，重新提取
+    for m in to_add:
+        m.bound = True
+    if allow_llm and final_bound:
+        _fill_graph_points(case, final_bound, on_stage=stage)
 
     changes = {}
-    if not accepted_payload:
-        for field in ("applicable_courses", "teaching_design"):
-            old_value = getattr(case, field, None)
-            if old_value is not None:
-                changes[field] = {"old": old_value, "new": None}
-            setattr(case, field, None)
-        return changes
-
-    from generate_case import enrich_case_with_knowledge
-    enrichment = enrich_case_with_knowledge(case.to_dict(), accepted_payload)
-
-    courses = enrichment.get("applicable_courses")
-    if isinstance(courses, list) and len(courses) == len(accepted_payload):
-        # 模型按提示词要求，为每条已采纳知识点按顺序各输出一条适用课程举例；这里直接按位置
-        # 把知识点描述原文逐字复原回对应行（供前端画树状图用的第四层叶子节点），不依赖模型
-        # 自己把description重新抄一遍——那样容易复述走样，见_kp_embedding_text()的注释
-        for row, mapping in zip(courses, accepted_payload):
-            if isinstance(row, dict):
-                row["知识点简述"] = mapping["description"]
-
-    for field in ("applicable_courses", "teaching_design"):
-        if field not in enrichment:
-            continue
+    for field, value in (("applicable_courses", new_courses), ("teaching_design", new_td)):
         old_value = getattr(case, field, None)
-        new_value = json.dumps(enrichment[field], ensure_ascii=False)
+        new_value = json.dumps(value, ensure_ascii=False) if value is not None else None
         if old_value != new_value:
             changes[field] = {"old": old_value, "new": new_value}
         setattr(case, field, new_value)
 
-    return changes
+    parts = []
+    if to_add:
+        parts.append(f"新增{len(to_add)}条")
+    if to_remove:
+        parts.append(f"移除{len(to_remove)}条")
+    return changes, ("、".join(parts) or "无变化") + td_note
+
+
+def sync_case_with_accepted_mappings(db, case, on_stage=None) -> tuple[dict, str]:
+    """"补充"按钮：让案例里写入的知识点跟当前"已采纳"的集合保持一致——已采纳但还没写进去
+    的追加进去，写进去了但已经不是已采纳的删掉；两边一致就什么都不做（不调模型）。
+    返回值同_apply_binding_changes"""
+    from db import CaseKnowledgeMapping  # 延迟import，避免和db.py出现循环依赖
+
+    mappings = [
+        m for m in db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.case_id == case.id).all()
+        if m.knowledge_point
+    ]
+    to_add = [m for m in mappings if m.status == "已采纳" and not m.bound]
+    to_remove = [m for m in mappings if m.bound and m.status != "已采纳"]
+    if not to_add and not to_remove:
+        # 内容已经一致，只补一下旧数据缺的知识图谱节点提取（提取结果不属于案例字段，不算内容变更）
+        filled = _fill_graph_points(case, [m for m in mappings if m.bound], on_stage=on_stage)
+        return {}, f"已是最新，无需更新（补全了{filled}条知识图谱的知识点提取）" if filled else "已是最新，无需更新"
+    return _apply_binding_changes(db, case, to_add, to_remove, on_stage=on_stage)
+
+
+def unbind_mapping_from_case(db, case, mapping, on_stage=None) -> tuple[dict, str]:
+    """知识点库里解绑：只把这一条从案例里删掉（教学设计正好依据它时重新生成），不顺带
+    同步其他还没写进去的已采纳知识点——那个要用户自己点"补充"按钮。返回值同上"""
+    return _apply_binding_changes(db, case, [], [mapping], on_stage=on_stage)
+
+
+def remove_points_from_case(db, case, mappings: list) -> tuple[dict, str]:
+    """强制删除知识点之前调用：把这些知识点从案例里删掉，不调模型（在HTTP请求里同步执行）。
+    教学设计依据的知识点被删时先清空，调用方据此另起后台任务重新生成。返回值同上"""
+    return _apply_binding_changes(db, case, [], mappings, allow_llm=False)
+
+
+def regenerate_missing_teaching_design(db, case, on_stage=None) -> tuple[dict, str]:
+    """教学设计为空、但还有已写入案例的知识点时，用其中相关度最高的一条重新生成教学设计
+    （强制删除知识点后的后台补生成）。教学设计已经有了或者一条绑定都没有就什么都不做"""
+    from db import CaseKnowledgeMapping  # 延迟import，避免和db.py出现循环依赖
+
+    if _load_json(case.teaching_design, None):
+        return {}, "教学设计已存在，无需更新"
+    bound = [
+        m for m in db.query(CaseKnowledgeMapping)
+        .filter(CaseKnowledgeMapping.case_id == case.id, CaseKnowledgeMapping.bound.is_(True)).all()
+        if m.knowledge_point
+    ]
+    if not bound:
+        return {}, "没有已写入案例的知识点，教学设计保持为空"
+    (on_stage or (lambda _msg: None))("重新生成教学设计")
+    _, td = _generate_rows(case, [max(bound, key=lambda m: m.relevance_score or 0)])
+    new_value = json.dumps(td, ensure_ascii=False) if td else None
+    changes = {"teaching_design": {"old": case.teaching_design, "new": new_value}} if new_value != case.teaching_design else {}
+    case.teaching_design = new_value
+    return changes, "教学设计已重新生成"
