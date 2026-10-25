@@ -106,16 +106,59 @@ def submit_generate_job(case_code: str, material_ids: list[int], requested_by: i
     return job_id
 
 
-def submit_match_knowledge_job(case_id: int, requested_by: int | None = None) -> int:
-    job_id = _create_job("match_knowledge", case_id=case_id, requested_by=requested_by)
-    _executor.submit(_run_match_knowledge, job_id, case_id)
+def submit_match_knowledge_job(case_id: int, auto_accept_limit: int = 5, requested_by: int | None = None) -> int:
+    job_id = _create_job(
+        "match_knowledge", case_id=case_id,
+        payload=json.dumps({"auto_accept_limit": auto_accept_limit}), requested_by=requested_by,
+    )
+    _executor.submit(_run_match_knowledge, job_id, case_id, auto_accept_limit)
     return job_id
 
 
-def submit_enrich_job(case_id: int, requested_by: int | None = None) -> int:
-    job_id = _create_job("enrich", case_id=case_id, requested_by=requested_by)
-    _executor.submit(_run_enrich, job_id, case_id)
+def submit_enrich_job(case_id: int, unbind_mapping_id: int | None = None,
+                      teaching_design_only: bool = False, requested_by: int | None = None) -> int:
+    """三种模式：
+    - 默认：按"补充"按钮的语义，把案例跟当前已采纳集合做增量同步
+    - unbind_mapping_id：知识点库里解绑，只从案例里删掉这一条
+    - teaching_design_only：强制删除知识点后，教学设计被清空了，用剩下的知识点重新生成"""
+    payload = {}
+    if unbind_mapping_id:
+        payload["unbind_mapping_id"] = unbind_mapping_id
+    if teaching_design_only:
+        payload["teaching_design_only"] = True
+    job_id = _create_job("enrich", case_id=case_id, payload=json.dumps(payload) if payload else None,
+                         requested_by=requested_by)
+    _executor.submit(_run_enrich, job_id, case_id, unbind_mapping_id, teaching_design_only)
     return job_id
+
+
+# 会改写案例内容的后台任务类型：运行期间案例锁住不让人工编辑
+CONTENT_JOB_TYPES = ("enrich", "sizheng", "discussion")
+
+
+def submit_sizheng_job(case_id: int, requested_by: int | None = None) -> int:
+    """重新生成案例的"课程思政元素分析"（总述+案例体现了的维度各一段论述+所属维度）"""
+    job_id = _create_job("sizheng", case_id=case_id, requested_by=requested_by)
+    _executor.submit(_run_sizheng, job_id, case_id)
+    return job_id
+
+
+def submit_discussion_job(case_id: int, requested_by: int | None = None) -> int:
+    """重新生成案例的「思考与讨论」"""
+    job_id = _create_job("discussion", case_id=case_id, requested_by=requested_by)
+    _executor.submit(_run_discussion, job_id, case_id)
+    return job_id
+
+
+def case_has_active_content_job(db, case_id: int) -> bool:
+    """这个案例的内容（适用课程举例/教学设计、课程思政元素分析）是不是正在被后台任务更新。
+    更新期间案例要锁住不让人工编辑：任务是"读取当前内容→调模型→写回"，中途有人工修改
+    的话，任务写回时会把人工改的内容覆盖掉（或者人工保存把任务刚写的覆盖掉）"""
+    return db.query(BackgroundJob).filter(
+        BackgroundJob.job_type.in_(CONTENT_JOB_TYPES),
+        BackgroundJob.case_id == case_id,
+        BackgroundJob.status.in_(["pending", "running"]),
+    ).first() is not None
 
 
 # ---------- 实际执行（都跑在线程池的工作线程里） ----------
@@ -170,6 +213,7 @@ def _run_generate(job_id: int, case_code: str, material_ids: list[int]):
                 # 这里留真正的NULL（不是json.dumps(None)那个字符串"null"）
                 applicable_courses=None,
                 teaching_design=None,
+                discussion_questions=json.dumps(draft.get("discussion_questions"), ensure_ascii=False),
                 further_reading=json.dumps(draft.get("further_reading"), ensure_ascii=False),
                 status="待审核",
             )
@@ -191,9 +235,17 @@ def _run_generate(job_id: int, case_code: str, material_ids: list[int]):
         _update_job(job_id, status="failed", error=str(e))
 
 
-def _run_match_knowledge(job_id: int, case_id: int):
+# 自动采纳的相关度门槛（relevance_score是0-100，大于这个值才自动采纳）
+AUTO_ACCEPT_MIN_SCORE = 50
+
+
+def _run_match_knowledge(job_id: int, case_id: int, auto_accept_limit: int = 5):
     """知识点匹配：向量+BM25混合粗筛 → LLM复核精排 → 清掉旧的"推荐"记录、写入新的。
-    已人工采纳/拒绝的记录不动（这段保留策略跟原来main.py端点里的逻辑一致，只是搬了个地方）。
+    已有决定的记录（已采纳/已拒绝/不适用）一律不动，对应的知识点也不再重复推荐。
+
+    自动采纳：新结果里相关度>AUTO_ACCEPT_MIN_SCORE的，按相关度从高到低自动设为已采纳，
+    名额是"auto_accept_limit减去这个案例已有的已采纳条数"——手动加之前自动采纳的已经
+    够N条了就不再自动采纳。只改状态，不自动写进案例，要用户点"补充"按钮同步。
     """
     _update_job(job_id, status="running")
     db = SessionLocal()
@@ -210,24 +262,40 @@ def _run_match_knowledge(job_id: int, case_id: int):
         # 文本的缓存），这里落库；不是用户可见的内容变更，不写审计日志
         db.commit()
 
-        # 清空旧的"推荐"记录避免重复堆积；已人工采纳/拒绝的决定予以保留
+        # 清空旧的"推荐"记录避免重复堆积；已有决定的记录予以保留。
+        # 注意已绑定（写进了案例）的推荐记录不能删——那是"采纳后又改回推荐、还没点补充同步"
+        # 的状态，删了之后案例里那一行就再也没有关联记录能把它删掉了
         db.query(CaseKnowledgeMapping).filter(
             CaseKnowledgeMapping.case_id == case_id,
             CaseKnowledgeMapping.status == "推荐",
+            CaseKnowledgeMapping.bound.is_(False),
         ).delete()
         db.commit()
 
+        existing = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.case_id == case_id).all()
+        decided_kp_ids = {m.knowledge_point_id for m in existing}
+        accepted_count = sum(1 for m in existing if m.status == "已采纳")
+        quota = max(0, auto_accept_limit - accepted_count)
+
+        # matches已经按相关度降序排好，从高到低占用自动采纳名额
+        auto_count = 0
         for m in matches:
+            kp_id = m["knowledge_point"].id
+            if kp_id in decided_kp_ids:
+                continue
+            auto = auto_count < quota and m["relevance_score"] > AUTO_ACCEPT_MIN_SCORE
+            auto_count += auto
             db.add(CaseKnowledgeMapping(
                 case_id=case_id,
-                knowledge_point_id=m["knowledge_point"].id,
+                knowledge_point_id=kp_id,
                 relevance_score=m["relevance_score"],
                 suggestion_text=m["suggestion_text"],
-                status="推荐",
+                status="已采纳" if auto else "推荐",
+                auto_accepted=auto,
             ))
         db.commit()
 
-        _update_job(job_id, status="done")
+        _update_job(job_id, status="done", current_stage=f"自动采纳{auto_count}条" if auto_count else None)
     except Exception as e:
         logger.exception(f"知识点匹配任务{job_id}失败")
         _update_job(job_id, status="failed", error=str(e))
@@ -235,29 +303,134 @@ def _run_match_knowledge(job_id: int, case_id: int):
         db.close()
 
 
-def _run_enrich(job_id: int, case_id: int):
-    """用已采纳的知识点关联，补充/更新案例的"适用课程举例"与"教学设计"两个字段。
-    原来这段逻辑在三个地方各调用一次（chat_agent的工具、PUT/DELETE两个mapping端点），
-    现在统一收敛到这里。"""
-    _update_job(job_id, status="running")
+def _run_enrich(job_id: int, case_id: int, unbind_mapping_id: int | None = None,
+                teaching_design_only: bool = False):
+    """把案例的"适用课程举例"与"教学设计"跟知识点关联同步（增量，见
+    knowledge_matching._apply_binding_changes）。两个入口：AI助手的"补充"工具（全量对比
+    已采纳集合），知识点库的解绑（只删这一条）。完成时把一句话结果写进current_stage，
+    前端和AI助手查任务时据此告诉用户新增/移除了几条，或者"已是最新，无需更新"。"""
+    _update_job(job_id, status="running", current_stage="对比知识点变化")
     db = SessionLocal()
     try:
-        from knowledge_matching import enrich_case_from_accepted_mappings  # 延迟import
+        from knowledge_matching import (  # 延迟import
+            sync_case_with_accepted_mappings, unbind_mapping_from_case, regenerate_missing_teaching_design,
+        )
+
+        def on_stage(msg: str):
+            _update_job(job_id, current_stage=msg)
 
         case = db.query(Case).filter(Case.id == case_id).first()
         if not case:
             _update_job(job_id, status="failed", error="案例不存在")
             return
 
-        changes = enrich_case_from_accepted_mappings(db, case)
+        if teaching_design_only:
+            changes, summary = regenerate_missing_teaching_design(db, case, on_stage=on_stage)
+        elif unbind_mapping_id:
+            mapping = db.query(CaseKnowledgeMapping).filter(CaseKnowledgeMapping.id == unbind_mapping_id).first()
+            if not mapping or not mapping.knowledge_point:
+                _update_job(job_id, status="done", current_stage="关联记录已不存在，无需更新")
+                return
+            changes, summary = unbind_mapping_from_case(db, case, mapping, on_stage=on_stage)
+        else:
+            changes, summary = sync_case_with_accepted_mappings(db, case, on_stage=on_stage)
+        db.commit()  # bound标记即使内容没变也可能变了（比如移除的行在旧数据里本来就认领不到）
         if changes:
-            db.commit()
             db.refresh(case)
             log_case_change(db, case.id, "知识点匹配(自动)", changes)
 
-        _update_job(job_id, status="done")
+        _update_job(job_id, status="done", current_stage=summary[:50])
     except Exception as e:
         logger.exception(f"知识点补充任务{job_id}失败")
         _update_job(job_id, status="failed", error=str(e))
     finally:
         db.close()
+
+
+def _run_sizheng(job_id: int, case_id: int):
+    """重新生成课程思政元素分析。模型调用（一两分钟）期间不占着session：先短开一次读出
+    标题和正文，调完模型再开一次写回。所属维度跟着更新——维度从五个变成六个后，有的案例
+    更适合归到新的"科学精神"章节"""
+    _update_job(job_id, status="running", current_stage="生成课程思政元素分析")
+    try:
+        from generate_case import generate_sizheng_analysis  # 延迟import
+
+        db = SessionLocal()
+        try:
+            case = db.query(Case).filter(Case.id == case_id).first()
+            if not case:
+                _update_job(job_id, status="failed", error="案例不存在")
+                return
+            title, narrative = case.title, case.full_narrative
+        finally:
+            db.close()
+        if not (narrative or "").strip():
+            _update_job(job_id, status="failed", error="案例正文为空，无法生成课程思政元素分析")
+            return
+
+        analysis = generate_sizheng_analysis(title, narrative)
+
+        _update_job(job_id, current_stage="写入数据库")
+        db = SessionLocal()
+        try:
+            case = db.query(Case).filter(Case.id == case_id).first()
+            if not case:
+                _update_job(job_id, status="failed", error="案例已被删除")
+                return
+            changes = {}
+            new_value = json.dumps(analysis, ensure_ascii=False)
+            if case.sizheng_elements != new_value:
+                changes["sizheng_elements"] = {"old": case.sizheng_elements, "new": new_value}
+                case.sizheng_elements = new_value
+            if case.dimension != analysis["对应维度"]:
+                changes["dimension"] = {"old": case.dimension, "new": analysis["对应维度"]}
+                case.dimension = analysis["对应维度"]
+            db.commit()
+            log_case_change(db, case.id, "课程思政元素分析(重新生成)", changes)
+        finally:
+            db.close()
+        _update_job(job_id, status="done", current_stage=f"所属维度：{analysis['对应维度']}")
+    except Exception as e:
+        logger.exception(f"课程思政元素分析任务{job_id}失败")
+        _update_job(job_id, status="failed", error=str(e))
+
+
+def _run_discussion(job_id: int, case_id: int):
+    """重新生成"思考与讨论"。跟_run_sizheng一样：模型调用期间不占着session"""
+    _update_job(job_id, status="running", current_stage="生成思考与讨论")
+    try:
+        from generate_case import generate_discussion_questions  # 延迟import
+
+        db = SessionLocal()
+        try:
+            case = db.query(Case).filter(Case.id == case_id).first()
+            if not case:
+                _update_job(job_id, status="failed", error="案例不存在")
+                return
+            title, narrative = case.title, case.full_narrative
+        finally:
+            db.close()
+        if not (narrative or "").strip():
+            _update_job(job_id, status="failed", error="案例正文为空，无法生成思考与讨论")
+            return
+
+        questions = generate_discussion_questions(title, narrative)
+
+        db = SessionLocal()
+        try:
+            case = db.query(Case).filter(Case.id == case_id).first()
+            if not case:
+                _update_job(job_id, status="failed", error="案例已被删除")
+                return
+            new_value = json.dumps(questions, ensure_ascii=False)
+            changes = {"discussion_questions": {"old": case.discussion_questions, "new": new_value}} \
+                if case.discussion_questions != new_value else {}
+            case.discussion_questions = new_value
+            db.commit()
+            log_case_change(db, case.id, "思考与讨论(重新生成)", changes)
+        finally:
+            db.close()
+        _update_job(job_id, status="done", current_stage=f"共{len(questions)}题")
+    except Exception as e:
+        logger.exception(f"思考与讨论任务{job_id}失败")
+        _update_job(job_id, status="failed", error=str(e))

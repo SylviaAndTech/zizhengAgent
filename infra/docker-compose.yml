@@ -42,7 +42,9 @@ services:
     # 暴露到宿主机等于给公网多开一个攻击面。需要本机调试时临时加 "127.0.0.1:3306:3306"
 
   chroma:
-    image: ccr.ccs.tencentyun.com/ideological/chroma:1.5.9
+    # 仓库名跟 TCR 上实际推的名字保持一致（chromadb，不是 chroma）——
+    # 官方镜像叫 chromadb/chroma，转推时通常沿用组织名 chromadb 做仓库名
+    image: ccr.ccs.tencentyun.com/ideological/chromadb:1.5.9
     container_name: sizheng-chroma
     restart: always
     environment:

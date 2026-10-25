@@ -17,6 +17,7 @@ Mermaid本身只在浏览器里跑（mermaid.js），Python后端没有原生渲
 失败——只是这张图导不出来，调用方拿到None就跳过嵌入图片，案例详情里原有的文字版表格
 还在，不影响内容完整性。
 """
+import json
 import logging
 
 logger = logging.getLogger("uvicorn.error")
@@ -24,11 +25,35 @@ logger = logging.getLogger("uvicorn.error")
 MERMAID_CDN_URL = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
 
 
+# 知识图谱的版式配置，唯一的一份：这里无头浏览器渲染导出用，接口也把它原样返回给前端，
+# 前端渲染前用它mermaid.initialize，页面上看到的和Word/下载图片里的就是同一套版式。
+# 注意不能写进图定义里的%%{init}%%指令——当前用的Mermaid 10.9对指令里的flowchart配置
+# （间距、连线形状）不生效，只有initialize才生效。
+# 字体要跟页面一致：Mermaid按渲染时的字体量出每个节点的宽高，量的字体跟显示的字体不一样，
+# 文字就会被节点边框截掉一截。Noto Sans CJK SC是Docker镜像里装的fonts-noto-cjk
+MERMAID_CONFIG = {
+    "securityLevel": "strict",
+    "theme": "base",
+    "themeVariables": {
+        "fontFamily": '"PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif',
+        "fontSize": "12px",
+        "lineColor": "#94A3B8",
+    },
+    # 紧凑：小间距、小内边距；连线用平滑曲线（basis）——试过直角折线（step），多条连线的
+    # 竖线段错开叠在一起，看着很乱
+    "flowchart": {"htmlLabels": True, "useMaxWidth": False, "padding": 6,
+                  "nodeSpacing": 10, "rankSpacing": 40, "curve": "basis"},
+}
+
+
 def _page_html(definition: str) -> str:
-    return f"""<!doctype html><html><body style="margin:0;background:white;">
+    config = json.dumps({**MERMAID_CONFIG, "startOnLoad": True}, ensure_ascii=False)
+    font = MERMAID_CONFIG["themeVariables"]["fontFamily"]
+    return f"""<!doctype html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;background:white;font-family:{font};">
 <div id="graph" class="mermaid">{definition}</div>
 <script src="{MERMAID_CDN_URL}"></script>
-<script>mermaid.initialize({{startOnLoad:true, securityLevel:"strict", theme:"base"}});</script>
+<script>mermaid.initialize({config});</script>
 </body></html>"""
 
 
@@ -58,7 +83,8 @@ def render_mermaid_batch(
                 for i, definition in pending:
                     page = None
                     try:
-                        page = browser.new_page(viewport={"width": width, "height": 900})
+                        # 2倍像素密度：嵌进Word后按页宽缩小显示，1倍图里的小字会糊
+                        page = browser.new_page(viewport={"width": width, "height": 900}, device_scale_factor=2)
                         page.set_content(_page_html(definition))
                         page.wait_for_selector("#graph svg", timeout=timeout_ms)
                         svg_el = page.query_selector("#graph svg")

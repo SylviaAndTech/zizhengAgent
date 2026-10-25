@@ -15,11 +15,12 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
+from sqlalchemy import or_
 
 from db import (
     SessionLocal, RawMaterial, Case, CaseKnowledgeMapping, BackgroundJob, DIMENSIONS,
 )
-from job_queue import submit_generate_job, submit_enrich_job
+from job_queue import submit_generate_job, submit_enrich_job, submit_sizheng_job, case_has_active_content_job
 from material_index import search_materials as _search_materials_impl
 from qwen_client import get_langchain_llm, require_api_key, MAX_TOOL_ROUNDS
 from audit import log_case_change
@@ -33,8 +34,9 @@ SYSTEM_PROMPT = f"""你是"思政案例生成工作台"的AI助手，帮助用�
 3. 编辑已有案例前，先用 get_case 工具看当前完整内容，只改用户要求的部分，其余字段原样保留（update_case 只需要传你要修改的字段）。
 4. 修改内容后必须调用 update_case 把结果写回数据库，不要只在聊天里描述而不落库。
 5. 如果用户是在描述内容而不是给出具体案例编号/素材ID（比如"有没有关于XX的素材"），用 search_materials 做语义检索，别瞎猜material_id。
-6. 如果用户要求"用已采纳的知识点补充案例的适用课程举例/教学设计"，直接调用 enrich_case_with_accepted_knowledge 工具（不要自己瞎编内容）。
-7. generate_case_draft 和 enrich_case_with_accepted_knowledge 这两个工具是"提交后台任务"，
+6. 如果用户要求"用已采纳的知识点补充案例的适用课程举例/教学设计"，直接调用 enrich_case_with_accepted_knowledge 工具（不要自己瞎编内容）；
+   如果用户要求重新生成/重写案例的"课程思政元素"，调用 regenerate_sizheng_analysis 工具，不要自己写了用 update_case 存进去。
+7. generate_case_draft、enrich_case_with_accepted_knowledge、regenerate_sizheng_analysis 这几个工具是"提交后台任务"，
    调用后立刻返回一个job_id，任务还在后台跑，**不代表已经做完了**。这时要如实告诉用户
    "已经提交、大概要多久、页面顶部有进度条"，绝对不能说成"已经生成好了"，也不要编造进度。
    用户之后问"生成得怎么样了/好了吗"，用 check_job 工具查真实状态再回答，不要凭感觉猜。
@@ -101,9 +103,9 @@ def get_case(case_id: int) -> str:
 @tool
 def generate_case_draft(case_code: str, material_ids: list[int]) -> str:
     """用指定的素材ID列表，提交一个"生成七段式案例草稿"的后台任务。
-    不需要指定思政维度——每个案例都要求对五个官方思政维度（政治认同/家国情怀/文化素养/
-    宪法法治意识/道德修养）逐一给出摘录表述+解释，案例所属的书稿章节分类（也是这五个维度之一）
-    由模型结合案例内容自主判断给出。
+    不需要指定思政维度——"课程思政元素分析"会先判断案例体现了六个思政维度（政治认同/家国情怀/
+    文化素养/科学精神/宪法法治意识/道德修养）中的哪几个，只对这几个展开论述；案例所属的书稿章节
+    分类（也是这六个维度之一）由模型结合案例内容自主判断给出。
 
     **这个工具只负责提交任务，立刻就返回，返回时案例还没生成好**——正文要走写作→评审→修订
     的多轮循环，通常5-20分钟。返回的job_id可以之后用 check_job 工具查进度。回复用户时要说
@@ -155,6 +157,7 @@ def update_case(
     sizheng_elements: dict = None,
     applicable_courses: list = None,
     teaching_design: dict = None,
+    discussion_questions: list = None,
     further_reading: list = None,
     status: str = None,
 ) -> str:
@@ -166,11 +169,15 @@ def update_case(
         case = db.query(Case).filter(Case.id == case_id).first()
         if not case:
             return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
+        if case_has_active_content_job(db, case_id):
+            return json.dumps({"error": f"案例{case.case_code}的内容正在后台更新，完成前不能修改，"
+                                        "请如实告诉用户稍后再试（可以用check_job查进度）"}, ensure_ascii=False)
 
         fields = {
             "title": title, "full_narrative": full_narrative,
             "teaching_objectives": teaching_objectives, "sizheng_elements": sizheng_elements,
             "applicable_courses": applicable_courses, "teaching_design": teaching_design,
+            "discussion_questions": discussion_questions,
             "further_reading": further_reading, "status": status,
         }
         changes = {}
@@ -194,28 +201,33 @@ def update_case(
 
 @tool
 def enrich_case_with_accepted_knowledge(case_id: int) -> str:
-    """用某个案例在「知识点匹配」页面已经人工标记为"已采纳"的知识点关联，提交一个后台任务，
-    调用模型补充/更新这个案例的"适用课程举例"与"教学设计"两个字段。这个案例必须已经跑过
-    知识点匹配、且至少有一条被标记为"已采纳"，否则会返回error，如果报错就把这个情况告诉用户，
-    不要自己凭空编造适用课程举例/教学设计的内容。
+    """把某个案例的"适用课程举例"与"教学设计"跟它在「知识点匹配」页面的"已采纳"知识点做
+    增量同步：已采纳但还没写进案例的追加进去，写进去了但已经不是已采纳的删掉，已经写进去
+    的内容不动；两边已经一致就什么都不改。这个案例必须至少有一条已采纳（或已写入案例）的
+    知识点关联，否则会返回error，如果报错就把这个情况告诉用户，不要自己凭空编造适用课程
+    举例/教学设计的内容。
 
-    **这个工具只负责提交任务，立刻就返回，返回时内容还没补充好**（模型调用通常几十秒到
-    一分钟），返回的job_id可以之后用 check_job 查进度。回复用户时不要说成已经补充完了。
+    **这个工具只负责提交任务，立刻就返回，返回时内容还没同步好**（需要调模型时通常几十秒
+    到一分钟），返回的job_id可以之后用 check_job 查进度；任务完成后current_stage字段是
+    这次同步的结果（新增/移除了几条，或者"已是最新，无需更新"）。回复用户时不要说成已经
+    补充完了。
 
-    注意：现在用户在页面上采纳/取消采纳知识点关联时后台会自动触发同样的补充任务，这个工具
-    通常不需要手动调用，只有用户明确要求"重新生成一次"之类的场景才用得上。"""
+    注意：用户在页面上采纳/取消采纳知识点时只改状态，不会自动同步到案例，必须调用这个工具。"""
     db = SessionLocal()
     try:
         case = db.query(Case).filter(Case.id == case_id).first()
         if not case:
             return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
 
-        has_accepted = (
+        has_any = (
             db.query(CaseKnowledgeMapping)
-            .filter(CaseKnowledgeMapping.case_id == case_id, CaseKnowledgeMapping.status == "已采纳")
+            .filter(
+                CaseKnowledgeMapping.case_id == case_id,
+                or_(CaseKnowledgeMapping.status == "已采纳", CaseKnowledgeMapping.bound.is_(True)),
+            )
             .first()
         )
-        if not has_accepted:
+        if not has_any:
             return json.dumps(
                 {"error": "这个案例还没有已采纳的知识点关联，请先在「知识点匹配」页面运行匹配并采纳至少一条"},
                 ensure_ascii=False,
@@ -225,16 +237,36 @@ def enrich_case_with_accepted_knowledge(case_id: int) -> str:
         return json.dumps({
             "job_id": job_id,
             "submitted": True,
-            "message": f"已提交补充任务（任务号{job_id}），预计几十秒到一分钟，完成后案例的"
-                       f"适用课程举例和教学设计会自动更新。",
+            "message": f"已提交同步任务（任务号{job_id}），只处理新增/去掉的知识点，已写入的内容不动；"
+                       f"需要调模型时预计几十秒到一分钟，用check_job查看结果。",
         }, ensure_ascii=False)
+    finally:
+        db.close()
+
+
+@tool
+def regenerate_sizheng_analysis(case_id: int) -> str:
+    """提交一个后台任务，重新生成某个案例的"课程思政元素分析"：一段总述 + 案例体现了的那几个
+    思政维度（从政治认同/家国情怀/文化素养/科学精神/宪法法治意识/道德修养中判断）各一段论述，
+    并重新判断案例所属的维度。**只负责提交任务，立刻返回**，生成通常要一两分钟，返回的job_id可以用check_job
+    查进度，回复用户时不要说成已经生成完了。"""
+    db = SessionLocal()
+    try:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if not case:
+            return json.dumps({"error": "案例不存在"}, ensure_ascii=False)
+        if case_has_active_content_job(db, case_id):
+            return json.dumps({"error": f"案例{case.case_code}的内容正在后台更新，请稍后再试"}, ensure_ascii=False)
+        job_id = submit_sizheng_job(case_id)
+        return json.dumps({"job_id": job_id, "submitted": True,
+                           "message": f"已提交（任务号{job_id}），预计一两分钟，用check_job查看结果。"}, ensure_ascii=False)
     finally:
         db.close()
 
 
 TOOLS = [
     list_materials, search_materials, list_cases, get_case, generate_case_draft, update_case,
-    enrich_case_with_accepted_knowledge, check_job,
+    enrich_case_with_accepted_knowledge, regenerate_sizheng_analysis, check_job,
 ]
 
 _agent = None

@@ -33,9 +33,48 @@ def set_default_font(doc, font_name: str = DEFAULT_FONT):
         rpr.rFonts.set(qn("w:eastAsia"), font_name)
 
 
-def write_case_section(doc, case_dict: dict, heading_level: int = 1, course_tree_png: bytes | None = None):
+_CN_NUMS = "一二三四五六七八九十"
+
+
+def sizheng_sections(se: dict) -> dict | None:
+    """课程思政元素分析里各维度的论述。早期版本的键叫"六维度阐述"（当时六个维度都写），
+    现在只写案例体现了的维度、键改叫"维度阐述"；两种都认。都不是（更早的五维度旧格式）返回None"""
+    for key in ("维度阐述", "六维度阐述"):
+        if isinstance(se.get(key), dict):
+            return se[key]
+    return None
+
+
+def _write_sizheng_analysis(doc, se: dict):
+    """课程思政元素分析：总述一段，再按维度"一、政治认同方面"……逐段论述"""
+    if se.get("对应维度"):
+        doc.add_paragraph(f"所属维度：{se['对应维度']}")
+    doc.add_paragraph(f"案例的课程思政元素分析：{se.get('总述') or ''}")
+    for i, (dim, text) in enumerate(sizheng_sections(se).items()):
+        p = doc.add_paragraph()
+        p.add_run(f"{_CN_NUMS[i]}、{dim}方面").bold = True
+        doc.add_paragraph(str(text or ""))
+
+
+def _write_legacy_sizheng(doc, se: dict):
+    """旧格式（五维度：摘录表述+解释）的课程思政元素，原样输出"""
+    for k, v in se.items():
+        if k == "五维度阐释" and isinstance(v, dict):
+            doc.add_paragraph("五维度阐释：")
+            for dim, detail in v.items():
+                if isinstance(detail, dict):
+                    doc.add_paragraph(f"　　{dim} - 摘录表述：{detail.get('摘录表述', '')}")
+                    doc.add_paragraph(f"　　{dim} - 解释：{detail.get('解释', '')}")
+                else:
+                    doc.add_paragraph(f"　　{dim}：{detail}")
+        else:
+            doc.add_paragraph(f"{k}：{v}")
+
+
+def write_case_section(doc, case_dict: dict, heading_level: int = 1, course_tree_png: bytes | None = None,
+                       course_table: bool = True):
     """case_dict: Case.to_dict() 的结果。
-    course_tree_png: 可选，"适用课程举例"树状图（案例↔课程↔章节↔知识点）预先渲染好的PNG字节
+    course_tree_png: 可选，该案例知识图谱（案例 → 课程 → 章节 → 知识点）预先渲染好的PNG字节
     ——渲染本身（Playwright起无头浏览器跑mermaid.js）比较慢，同一次导出可能有几十个案例，
     要在调用方批量渲染一次后逐个传进来，不要在这个函数里每个案例单独渲染一次，见
     mermaid_render.render_mermaid_batch()。不传或传None就只写文字版表格，不嵌图片
@@ -54,21 +93,17 @@ def write_case_section(doc, case_dict: dict, heading_level: int = 1, course_tree
         doc.add_paragraph(f"{k}：{v}")
 
     doc.add_heading("三、课程思政元素", level=sub)
-    for k, v in (d["sizheng_elements"] or {}).items():
-        if k == "五维度阐释" and isinstance(v, dict):
-            doc.add_paragraph("五维度阐释：")
-            for dim, detail in v.items():
-                if isinstance(detail, dict):
-                    doc.add_paragraph(f"　　{dim} - 摘录表述：{detail.get('摘录表述', '')}")
-                    doc.add_paragraph(f"　　{dim} - 解释：{detail.get('解释', '')}")
-                else:
-                    doc.add_paragraph(f"　　{dim}：{detail}")
-        else:
-            doc.add_paragraph(f"{k}：{v}")
+    se = d["sizheng_elements"] or {}
+    if sizheng_sections(se) is not None:
+        _write_sizheng_analysis(doc, se)
+    else:
+        _write_legacy_sizheng(doc, se)
 
     doc.add_heading("四、适用课程举例", level=sub)
     courses = d["applicable_courses"] or []
-    if courses:
+    # course_table=False：只放知识图谱、不出表格（成书用——课程/章节/融入方式建议在书末附录二里
+    # 统一汇总，每个案例里再出一遍表格显得重复）
+    if courses and course_table:
         table = doc.add_table(rows=1, cols=3)
         table.style = "Table Grid"
         hdr = table.rows[0].cells
@@ -80,14 +115,24 @@ def write_case_section(doc, case_dict: dict, heading_level: int = 1, course_tree
             cells[2].text = str(row.get("融入方式建议", ""))
 
     if course_tree_png:
-        doc.add_paragraph("知识点关联树状图：")
+        doc.add_paragraph("案例知识图谱（案例 → 课程 → 章节 → 知识点）：")
         doc.add_picture(io.BytesIO(course_tree_png), width=Inches(6.3))
+    elif not course_table:
+        # 不出表格时图又没有，这一节就空了，写明原因
+        doc.add_paragraph("（暂无，案例尚未写入课程知识点）" if not courses
+                          else "（知识图谱图片生成失败：服务器需要安装Playwright浏览器内核，执行 playwright install chromium）")
 
     doc.add_heading("五、教学设计", level=sub)
     for k, v in (d["teaching_design"] or {}).items():
+        if k == "依据知识点ID":  # 内部记录用的字段（教学设计依据哪条知识点生成），不是正文内容
+            continue
         doc.add_paragraph(f"{k}：{v}")
 
-    doc.add_heading("六、延伸阅读", level=sub)
+    doc.add_heading("六、思考与讨论", level=sub)
+    for i, q in enumerate(d.get("discussion_questions") or [], start=1):
+        doc.add_paragraph(f"{i}. {q}")
+
+    doc.add_heading("七、延伸阅读", level=sub)
     for r in (d["further_reading"] or []):
         doc.add_paragraph(f"[{r.get('type', '')}] {r.get('title', '')} {r.get('url', '')}")
 

@@ -3,12 +3,15 @@
 
 案例正文生成分两大段：①事实提炼（低温，追求准确）；②正文写作与评审——由
 case_agent_graph.py 里的 writer/judge/reviser 三节点循环完成初稿写作、rubric打分、
-按问题类型路由到局部修订或整体重写，收敛后再进入③结构化字段（教学目标/课程思政元素/
+按问题类型路由到局部修订或整体重写，收敛后再进入③结构化字段（标题/教学目标/
 延伸阅读等偏公文语气的字段，跟叙事体正文分开生成，避免模型把整体语域拉平、变成正确但
 无趣的八股文——这也是客户反馈"案例过于AI"的根源）。
 详见 prompts.py 里 FACT_EXTRACTION/CASE_NARRATIVE_STYLE/CASE_STRUCTURED_FIELDS 三块
 prompt 上面的注释，以及 case_agent_graph.py/case_agents.py/style_rubric.py 里
 写作-评审循环的设计说明。
+④课程思政元素分析：总述+六个维度的论述段落+所属维度，篇幅长、更看重文笔，单独一步用
+写正文的强模型生成（generate_sizheng_analysis），已有案例也可以单独重新生成这一部分。
+⑤思考与讨论：给学生读完案例后思考的问题（generate_discussion_questions），同样可单独重新生成。
 """
 from prompts import (
     CASE_ENRICH_SYSTEM_PROMPT, build_enrich_prompt,
@@ -16,9 +19,13 @@ from prompts import (
     NARRATIVE_ARC_SYSTEM_PROMPT, build_narrative_arc_prompt,
     CASE_STRUCTURED_FIELDS_SYSTEM_PROMPT, build_structured_fields_prompt,
     TOPIC_KEYWORDS_SYSTEM_PROMPT, build_topic_keywords_prompt,
+    SIZHENG_ANALYSIS_SYSTEM_PROMPT, build_sizheng_analysis_prompt,
+    DISCUSSION_QUESTIONS_SYSTEM_PROMPT, build_discussion_questions_prompt,
 )
+from db import DIMENSIONS
+from doc_writer import strip_citations
 from case_agent_graph import build_case_graph, DEFAULT_MAX_ITERATIONS
-from qwen_client import require_api_key, CHAT_MODEL, chat_json, chat_text
+from qwen_client import require_api_key, CHAT_MODEL, NARRATIVE_MODEL, chat_json, chat_text
 
 
 def _extract_facts(case_code: str, materials: list[dict]) -> dict:
@@ -54,6 +61,50 @@ def _generate_structured_fields(case_code: str, materials: list[dict], facts: di
     return chat_json(CASE_STRUCTURED_FIELDS_SYSTEM_PROMPT, prompt, max_tokens=4000)
 
 
+def generate_sizheng_analysis(case_title: str, narrative: str) -> dict:
+    """第④步：课程思政元素分析，返回 {"对应维度", "总述", "维度阐述": {维度: 一段话}}。
+    模型先判断案例体现了六个维度里的哪几个，只对这几个展开（不是六个都写）。
+    正文里的[素材N:定位短语]引用标注先去掉，不然模型会把它们抄进分析里。
+    一个维度都没写、写了不认识的维度名、对应维度不在展开的维度里，重试一次，还不行就报错"""
+    require_api_key()
+    prompt = build_sizheng_analysis_prompt(case_title or "", strip_citations(narrative))
+    problem = ""
+    for _attempt in range(2):
+        result = chat_json(SIZHENG_ANALYSIS_SYSTEM_PROMPT, prompt, max_tokens=8000,
+                           model=NARRATIVE_MODEL, temperature=0.5)
+        sections = result.get("维度阐述") if isinstance(result, dict) else None
+        sections = {k: str(v).strip() for k, v in (sections or {}).items() if str(v or "").strip()} \
+            if isinstance(sections, dict) else {}
+        unknown = [k for k in sections if k not in DIMENSIONS]
+        if not sections or unknown:
+            problem = f"维度名称不对：{'、'.join(unknown)}" if unknown else "一个维度都没有展开"
+            continue
+        if result.get("对应维度") not in sections:
+            problem = f"对应维度（{result.get('对应维度')}）不在展开的维度里"
+            continue
+        if not str(result.get("总述") or "").strip():
+            problem = "缺少总述"
+            continue
+        return {
+            "对应维度": result["对应维度"],
+            "总述": str(result["总述"]).strip(),
+            "维度阐述": {d: sections[d] for d in DIMENSIONS if d in sections},  # 按六个维度的固定顺序
+        }
+    raise ValueError(f"课程思政元素分析生成结果不完整（{problem}），请重试")
+
+
+def generate_discussion_questions(case_title: str, narrative: str) -> list[str]:
+    """第⑤步："思考与讨论"，给学生读完案例后思考的问题（一道思考题+一道实践探究题）"""
+    require_api_key()
+    prompt = build_discussion_questions_prompt(case_title or "", strip_citations(narrative))
+    result = chat_json(DISCUSSION_QUESTIONS_SYSTEM_PROMPT, prompt, max_tokens=1500,
+                       model=NARRATIVE_MODEL, temperature=0.6)
+    questions = [str(q).strip() for q in (result.get("思考与讨论") or []) if str(q).strip()]
+    if not questions:
+        raise ValueError("「思考与讨论」生成结果为空，请重试")
+    return questions
+
+
 def generate_case_draft(case_code: str, materials: list[dict], on_stage=None) -> dict:
     """
     materials: [{"id": int, "url": str, "title": str, "text": str}, ...]
@@ -63,9 +114,8 @@ def generate_case_draft(case_code: str, materials: list[dict], on_stage=None) ->
     返回解析后的案例草稿 dict（结构见 prompts.py 中的JSON schema），额外多一个
     full_narrative_draft字段——写作者给出的第一版正文（评审/修订循环开始之前），跟收敛后的
     full_narrative一起返回，方便调用方两份都存下来、都能在案例详情里对照查看。
-    所属思政维度不是入参——每个案例现在都要求对五个官方思政维度逐一给出摘录表述+解释
-    （sizheng_elements.五维度阐释），"对应维度"（书稿五个章节分类里的哪一个）改由模型结合
-    案例内容自主判断给出。
+    所属思政维度不是入参——"课程思政元素分析"一步先判断案例体现了哪几个思政维度、只论述这几个，并由模型结合
+    案例内容判断"对应维度"（书稿六个维度章节里的哪一个）。
     """
     if not materials:
         raise ValueError("没有可用的素材，无法生成案例（避免模型凭空编造）")
@@ -94,6 +144,11 @@ def generate_case_draft(case_code: str, materials: list[dict], on_stage=None) ->
 
     _stage("结构化字段")
     structured = _generate_structured_fields(case_code, materials, facts, narrative_final)
+
+    _stage("课程思政元素分析")
+    structured["sizheng_elements"] = generate_sizheng_analysis(structured.get("title"), narrative_final)
+    _stage("思考与讨论")
+    structured["discussion_questions"] = generate_discussion_questions(structured.get("title"), narrative_final)
 
     structured["full_narrative"] = narrative_final
     structured["full_narrative_draft"] = narrative_draft

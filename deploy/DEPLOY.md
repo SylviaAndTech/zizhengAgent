@@ -142,12 +142,12 @@ docker pull mysql:8.0
 docker pull chromadb/chroma:1.5.9
 
 # 3) 打上 TCR 的标签
-docker tag mysql:8.0            ccr.ccs.tencentyun.com/ideological/mysql:8.0
-docker tag chromadb/chroma:1.5.9 ccr.ccs.tencentyun.com/ideological/chroma:1.5.9
+docker tag mysql:8.0             ccr.ccs.tencentyun.com/ideological/mysql:8.0
+docker tag chromadb/chroma:1.5.9 ccr.ccs.tencentyun.com/ideological/chromadb:1.5.9
 
 # 4) 推上去
 docker push ccr.ccs.tencentyun.com/ideological/mysql:8.0
-docker push ccr.ccs.tencentyun.com/ideological/chroma:1.5.9
+docker push ccr.ccs.tencentyun.com/ideological/chromadb:1.5.9
 ```
 
 **验证**：腾讯云控制台 → 容器镜像服务 → 镜像仓库，应该能看到 `mysql` 和 `chroma` 两个仓库。
